@@ -2,7 +2,6 @@ package agent
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"time"
@@ -11,12 +10,25 @@ import (
 	"github.com/Conly-Zy/CTF-Agent/internal/tools"
 )
 
+type Logger interface {
+	Log(level, message string)
+	ToolStart(tool string)
+	ToolResult(tool, result string)
+	Thinking(content string)
+	Flag(flag string)
+}
+
 type Orchestrator struct {
 	llmClient    *llm.Client
 	toolRegistry *tools.Registry
 	logger       *slog.Logger
+	store        Store
 	maxIter      int
 	timeout      time.Duration
+}
+
+type Store interface {
+	AddConversationMessage(msg any) error
 }
 
 type SolveRequest struct {
@@ -27,11 +39,12 @@ type SolveRequest struct {
 }
 
 type SolveResult struct {
-	Success   bool
-	Flag      string
-	Iterations int
-	Duration  time.Duration
-	Error     error
+	Success     bool
+	Flag        string
+	Iterations  int
+	Duration    time.Duration
+	CompletedAt time.Time
+	Error       error
 }
 
 func NewOrchestrator(llmClient *llm.Client, toolRegistry *tools.Registry, logger *slog.Logger, maxIter int, timeout time.Duration) *Orchestrator {
@@ -44,11 +57,23 @@ func NewOrchestrator(llmClient *llm.Client, toolRegistry *tools.Registry, logger
 	}
 }
 
+func (o *Orchestrator) SetStore(store Store) {
+	o.store = store
+}
+
 func (o *Orchestrator) Solve(ctx context.Context, req SolveRequest) (*SolveResult, error) {
+	return o.SolveWithCallback(req, nil)
+}
+
+func (o *Orchestrator) SolveWithCallback(req SolveRequest, log Logger) (*SolveResult, error) {
 	start := time.Now()
 
-	ctx, cancel := context.WithTimeout(ctx, o.timeout)
+	ctx, cancel := context.WithTimeout(context.Background(), o.timeout)
 	defer cancel()
+
+	if log != nil {
+		log.Log("info", "Building system prompt...")
+	}
 
 	systemPrompt := o.buildSystemPrompt(req)
 	messages := []llm.Message{
@@ -65,8 +90,16 @@ func (o *Orchestrator) Solve(ctx context.Context, req SolveRequest) (*SolveResul
 		}
 	}
 
+	if log != nil {
+		log.Log("info", "Starting solving loop...")
+	}
+
 	for i := 0; i < o.maxIter; i++ {
 		o.logger.Info("iteration", "count", i+1)
+
+		if log != nil {
+			log.Log("info", fmt.Sprintf("Iteration %d/%d", i+1, o.maxIter))
+		}
 
 		resp, err := o.llmClient.CreateMessage(ctx, llm.MessageParams{
 			SystemPrompt: systemPrompt,
@@ -78,40 +111,89 @@ func (o *Orchestrator) Solve(ctx context.Context, req SolveRequest) (*SolveResul
 			return nil, fmt.Errorf("LLM call failed: %w", err)
 		}
 
-		o.logResponse(resp)
+		// Log thinking/text
+		text := resp.GetText()
+		if text != "" && log != nil {
+			log.Thinking(text)
+		}
 
+		// Check for flag
 		if flag := o.extractFlag(resp); flag != "" {
 			o.logger.Info("flag found", "flag", flag)
+			if log != nil {
+				log.Flag(flag)
+			}
 			return &SolveResult{
-				Success:    true,
-				Flag:       flag,
-				Iterations: i + 1,
-				Duration:   time.Since(start),
+				Success:     true,
+				Flag:        flag,
+				Iterations:  i + 1,
+				Duration:    time.Since(start),
+				CompletedAt: time.Now(),
 			}, nil
 		}
 
-		if resp.StopReason == "end_turn" {
-			o.logger.Info("LLM ended turn without finding flag")
-			continue
-		}
-
+		// Execute tools
 		toolUses := resp.GetToolUse()
 		if len(toolUses) == 0 {
+			if resp.StopReason == "end_turn" {
+				if log != nil {
+					log.Log("warning", "Agent ended turn without finding flag")
+				}
+				continue
+			}
 			continue
 		}
 
-		assistantMsg := llm.Message{Role: "assistant", Content: resp.GetText()}
+		// Add assistant message
+		assistantMsg := llm.Message{Role: "assistant", Content: text}
 		messages = append(messages, assistantMsg)
 
-		toolResults := o.executeTools(ctx, toolUses)
-		messages = append(messages, llm.Message{Role: "user", Content: toolResults})
+		// Execute tools and collect results
+		for _, tu := range toolUses {
+			if log != nil {
+				log.ToolStart(tu.Name)
+			}
+
+			tool, ok := o.toolRegistry.Get(tu.Name)
+			if !ok {
+				errMsg := fmt.Sprintf("Tool not found: %s", tu.Name)
+				if log != nil {
+					log.Log("error", errMsg)
+				}
+				messages = append(messages, llm.Message{
+					Role:    "user",
+					Content: errMsg,
+				})
+				continue
+			}
+
+			output, err := tool.Execute(ctx, tu.Input)
+			if err != nil {
+				errMsg := fmt.Sprintf("Tool error: %v", err)
+				if log != nil {
+					log.Log("error", errMsg)
+				}
+				output = errMsg
+			}
+
+			if log != nil {
+				log.ToolResult(tu.Name, output)
+			}
+
+			// Add tool result as user message
+			messages = append(messages, llm.Message{
+				Role:    "user",
+				Content: fmt.Sprintf("Tool %s result:\n%s", tu.Name, output),
+			})
+		}
 	}
 
 	return &SolveResult{
-		Success:    false,
-		Iterations: o.maxIter,
-		Duration:   time.Since(start),
-		Error:      fmt.Errorf("max iterations reached without finding flag"),
+		Success:     false,
+		Iterations:  o.maxIter,
+		Duration:    time.Since(start),
+		CompletedAt: time.Now(),
+		Error:       fmt.Errorf("max iterations reached without finding flag"),
 	}, nil
 }
 
@@ -151,42 +233,6 @@ func (o *Orchestrator) buildUserMessage(req SolveRequest) string {
 	return msg
 }
 
-func (o *Orchestrator) executeTools(ctx context.Context, toolUses []llm.ContentBlock) string {
-	var results []map[string]any
-
-	for _, tu := range toolUses {
-		o.logger.Info("executing tool", "tool", tu.Name)
-
-		tool, ok := o.toolRegistry.Get(tu.Name)
-		if !ok {
-			results = append(results, map[string]any{
-				"tool_use_id": tu.ID,
-				"content":     fmt.Sprintf("Tool not found: %s", tu.Name),
-			})
-			continue
-		}
-
-		output, err := tool.Execute(ctx, tu.Input)
-		if err != nil {
-			o.logger.Error("tool execution failed", "tool", tu.Name, "error", err)
-			results = append(results, map[string]any{
-				"tool_use_id": tu.ID,
-				"content":     fmt.Sprintf("Error: %v", err),
-			})
-			continue
-		}
-
-		o.logger.Info("tool execution completed", "tool", tu.Name, "output_len", len(output))
-		results = append(results, map[string]any{
-			"tool_use_id": tu.ID,
-			"content":     output,
-		})
-	}
-
-	data, _ := json.Marshal(results)
-	return string(data)
-}
-
 func (o *Orchestrator) extractFlag(resp *llm.MessageResponse) string {
 	text := resp.GetText()
 	flagPatterns := []string{"flag{", "CTF{", "picoCTF{", "FLAG{"}
@@ -204,17 +250,6 @@ func (o *Orchestrator) extractFlag(resp *llm.MessageResponse) string {
 	}
 
 	return ""
-}
-
-func (o *Orchestrator) logResponse(resp *llm.MessageResponse) {
-	for _, block := range resp.Content {
-		switch block.Type {
-		case "text":
-			o.logger.Debug("LLM text", "content", block.Text)
-		case "tool_use":
-			o.logger.Debug("LLM tool use", "tool", block.Name, "input", string(block.Input))
-		}
-	}
 }
 
 func indexOf(s, substr string) int {

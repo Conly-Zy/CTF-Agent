@@ -1,3 +1,7 @@
+// State
+let ws = null;
+let currentSessionId = null;
+
 // Navigation
 document.querySelectorAll('.nav-links a').forEach(link => {
     link.addEventListener('click', (e) => {
@@ -28,6 +32,139 @@ async function loadPage(page) {
             break;
     }
 }
+
+// WebSocket connection
+function connectWebSocket() {
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
+
+    ws.onopen = () => {
+        console.log('WebSocket connected');
+    };
+
+    ws.onmessage = (event) => {
+        const data = JSON.parse(event.data);
+        handleWebSocketMessage(data);
+    };
+
+    ws.onclose = () => {
+        console.log('WebSocket disconnected');
+        setTimeout(connectWebSocket, 3000);
+    };
+}
+
+function handleWebSocketMessage(data) {
+    const log = document.getElementById('output-log');
+
+    switch (data.type) {
+        case 'log':
+            appendLog(data.level, data.message);
+            break;
+        case 'tool_start':
+            appendLog('tool', `Calling tool: ${data.tool}`);
+            break;
+        case 'tool_result':
+            appendLog('info', `Tool result: ${data.result.substring(0, 200)}...`);
+            break;
+        case 'thinking':
+            appendLog('info', `Thinking: ${data.content}`);
+            break;
+        case 'flag':
+            appendLog('flag', `FLAG FOUND: ${data.flag}`);
+            showResult(data);
+            break;
+        case 'complete':
+            updateStatus(data.success ? 'success' : 'failed');
+            if (!data.success) {
+                appendLog('error', `Failed: ${data.error}`);
+            }
+            enableForm(true);
+            break;
+        case 'error':
+            appendLog('error', `Error: ${data.message}`);
+            break;
+    }
+}
+
+function appendLog(level, message) {
+    const log = document.getElementById('output-log');
+    const entry = document.createElement('div');
+    entry.className = `log-entry ${level}`;
+    entry.textContent = `[${new Date().toLocaleTimeString()}] ${message}`;
+    log.appendChild(entry);
+    log.scrollTop = log.scrollHeight;
+}
+
+function updateStatus(status) {
+    const badge = document.getElementById('solve-status');
+    badge.className = `status-badge status-${status}`;
+    badge.textContent = status.charAt(0).toUpperCase() + status.slice(1);
+}
+
+function showResult(data) {
+    const resultDiv = document.getElementById('solve-result');
+    resultDiv.style.display = 'block';
+
+    document.getElementById('result-flag').textContent = data.flag;
+
+    const stats = document.getElementById('result-stats');
+    stats.innerHTML = `
+        <span>Iterations: ${data.iterations || 0}</span>
+        <span>Duration: ${data.duration || '0s'}</span>
+    `;
+}
+
+function enableForm(enabled) {
+    document.getElementById('start-solve').disabled = !enabled;
+    document.getElementById('challenge-type').disabled = !enabled;
+    document.getElementById('challenge-desc').disabled = !enabled;
+    document.getElementById('challenge-target').disabled = !enabled;
+    document.getElementById('challenge-files').disabled = !enabled;
+}
+
+// Start solving
+document.getElementById('start-solve').addEventListener('click', async () => {
+    const type = document.getElementById('challenge-type').value;
+    const desc = document.getElementById('challenge-desc').value;
+    const target = document.getElementById('challenge-target').value;
+    const files = document.getElementById('challenge-files').value;
+
+    if (!desc && !target) {
+        alert('Please provide a description or target');
+        return;
+    }
+
+    // Reset UI
+    document.getElementById('output-log').innerHTML = '';
+    document.getElementById('solve-result').style.display = 'none';
+    updateStatus('solving');
+    enableForm(false);
+    appendLog('info', 'Starting challenge solving...');
+
+    try {
+        const res = await fetch('/api/solve', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                challenge_type: type,
+                description: desc,
+                target: target,
+                files: files ? files.split(',').map(f => f.trim()) : []
+            })
+        });
+
+        const data = await res.json();
+
+        if (data.session_id) {
+            currentSessionId = data.session_id;
+            appendLog('info', `Session created: #${data.session_id}`);
+        }
+    } catch (err) {
+        appendLog('error', `Failed to start: ${err.message}`);
+        updateStatus('failed');
+        enableForm(true);
+    }
+});
 
 // Dashboard
 async function loadDashboard() {
@@ -64,7 +201,14 @@ async function loadDashboard() {
 // Sessions
 async function loadSessions() {
     try {
-        const res = await fetch('/api/sessions');
+        const type = document.getElementById('session-type-filter').value;
+        const status = document.getElementById('session-status-filter').value;
+
+        let url = '/api/sessions?';
+        if (type) url += `type=${type}&`;
+        if (status) url += `status=${status}&`;
+
+        const res = await fetch(url);
         const sessions = await res.json();
         renderSessionList('all-sessions', sessions);
     } catch (err) {
@@ -74,6 +218,11 @@ async function loadSessions() {
 
 function renderSessionList(containerId, sessions) {
     const container = document.getElementById(containerId);
+    if (!sessions || sessions.length === 0) {
+        container.innerHTML = '<div style="padding:20px;text-align:center;color:#666;">No sessions found</div>';
+        return;
+    }
+
     container.innerHTML = sessions.map(s => `
         <div class="session-item" onclick="showSession(${s.id})">
             <div class="session-header">
@@ -121,11 +270,11 @@ async function showSession(id) {
         content += '<h3>Conversation</h3><div class="conversation">';
         messages.forEach(msg => {
             if (msg.role === 'assistant' && msg.content) {
-                content += `<div class="msg assistant"><strong>Agent:</strong><br>${msg.content}</div>`;
+                content += `<div class="msg assistant"><strong>Agent:</strong><br>${escapeHtml(msg.content)}</div>`;
             } else if (msg.role === 'user' && msg.tool_name) {
                 content += `<div class="msg tool"><strong>Tool: ${msg.tool_name}</strong><br>
-                    <pre>${msg.tool_input}</pre>
-                    ${msg.content ? '<br><strong>Result:</strong><br><pre>' + msg.content + '</pre>' : ''}
+                    <pre>${escapeHtml(msg.tool_input)}</pre>
+                    ${msg.content ? '<br><strong>Result:</strong><br><pre>' + escapeHtml(msg.content) + '</pre>' : ''}
                 </div>`;
             }
         });
@@ -152,6 +301,11 @@ async function loadKnowledge() {
 
 function renderKnowledgeList(items) {
     const container = document.getElementById('knowledge-list');
+    if (!items || items.length === 0) {
+        container.innerHTML = '<div style="padding:20px;text-align:center;color:#666;">No knowledge entries found</div>';
+        return;
+    }
+
     container.innerHTML = items.map(k => `
         <div class="knowledge-item" onclick="showKnowledge(${k.id})">
             <div class="knowledge-header">
@@ -208,17 +362,9 @@ async function searchKnowledge() {
 }
 
 // Filters
-document.getElementById('session-type-filter')?.addEventListener('change', async () => {
-    await loadSessions();
-});
-
-document.getElementById('session-status-filter')?.addEventListener('change', async () => {
-    await loadSessions();
-});
-
-document.getElementById('knowledge-type-filter')?.addEventListener('change', async () => {
-    await loadKnowledge();
-});
+document.getElementById('session-type-filter')?.addEventListener('change', loadSessions);
+document.getElementById('session-status-filter')?.addEventListener('change', loadSessions);
+document.getElementById('knowledge-type-filter')?.addEventListener('change', loadKnowledge);
 
 // Modal close
 document.querySelector('.close').addEventListener('click', () => {
@@ -231,5 +377,13 @@ window.addEventListener('click', (e) => {
     }
 });
 
-// Initial load
-loadDashboard();
+// Helper
+function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+}
+
+// Init
+connectWebSocket();
+loadPage('solve');

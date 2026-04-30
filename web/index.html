@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>CTF-Agent Dashboard</title>
+    <title>CTF-Agent</title>
     <link rel="stylesheet" href="/static/css/style.css">
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/github-markdown-css@5/github-markdown.min.css">
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11/styles/github.min.css">
@@ -12,35 +12,66 @@
     <nav class="sidebar">
         <div class="logo">
             <h1>CTF-Agent</h1>
+            <p>AI-Powered CTF Solver</p>
         </div>
         <ul class="nav-links">
-            <li><a href="#" class="active" data-page="dashboard">Dashboard</a></li>
-            <li><a href="#" data-page="sessions">Sessions</a></li>
-            <li><a href="#" data-page="knowledge">Knowledge</a></li>
+            <li><a href="#" class="active" data-page="solve">
+                <span class="icon">&#9654;</span> Solve Challenge
+            </a></li>
+            <li><a href="#" data-page="sessions">
+                <span class="icon">&#9776;</span> Sessions
+            </a></li>
+            <li><a href="#" data-page="knowledge">
+                <span class="icon">&#128218;</span> Knowledge Base
+            </a></li>
+            <li><a href="#" data-page="dashboard">
+                <span class="icon">&#128200;</span> Dashboard
+            </a></li>
         </ul>
     </nav>
 
     <main class="content">
-        <!-- Dashboard Page -->
-        <div id="dashboard" class="page active">
-            <h2>Dashboard</h2>
-            <div class="stats-grid">
-                <div class="stat-card">
-                    <h3>Total Sessions</h3>
-                    <p class="stat-value" id="stat-total">0</p>
+        <!-- Solve Challenge Page -->
+        <div id="solve" class="page active">
+            <h2>Solve Challenge</h2>
+            <div class="solve-container">
+                <div class="solve-form">
+                    <div class="form-group">
+                        <label for="challenge-type">Challenge Type</label>
+                        <select id="challenge-type">
+                            <option value="web">Web Security</option>
+                            <option value="pwn">Binary Exploitation (Pwn)</option>
+                            <option value="crypto">Cryptography</option>
+                            <option value="reverse">Reverse Engineering</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label for="challenge-desc">Description</label>
+                        <textarea id="challenge-desc" placeholder="Describe the challenge..."></textarea>
+                    </div>
+                    <div class="form-group">
+                        <label for="challenge-target">Target (URL/Host)</label>
+                        <input type="text" id="challenge-target" placeholder="http://example.com or host:port">
+                    </div>
+                    <div class="form-group">
+                        <label for="challenge-files">Files (comma separated paths)</label>
+                        <input type="text" id="challenge-files" placeholder="/path/to/file1, /path/to/file2">
+                    </div>
+                    <button id="start-solve" class="btn-primary">Start Solving</button>
                 </div>
-                <div class="stat-card">
-                    <h3>Success Rate</h3>
-                    <p class="stat-value" id="stat-rate">0%</p>
-                </div>
-                <div class="stat-card">
-                    <h3>Avg Duration</h3>
-                    <p class="stat-value" id="stat-duration">0s</p>
+                <div class="solve-output">
+                    <div class="output-header">
+                        <h3>Output</h3>
+                        <span id="solve-status" class="status-badge status-pending">Ready</span>
+                    </div>
+                    <div id="output-log" class="output-log"></div>
+                    <div id="solve-result" class="solve-result" style="display:none;">
+                        <h3>Result</h3>
+                        <div id="result-flag" class="flag-box"></div>
+                        <div id="result-stats" class="result-stats"></div>
+                    </div>
                 </div>
             </div>
-            <div class="type-stats" id="type-stats"></div>
-            <h3>Recent Sessions</h3>
-            <div class="session-list" id="recent-sessions"></div>
         </div>
 
         <!-- Sessions Page -->
@@ -81,6 +112,28 @@
                 </select>
             </div>
             <div class="knowledge-list" id="knowledge-list"></div>
+        </div>
+
+        <!-- Dashboard Page -->
+        <div id="dashboard" class="page">
+            <h2>Dashboard</h2>
+            <div class="stats-grid">
+                <div class="stat-card">
+                    <h3>Total Sessions</h3>
+                    <p class="stat-value" id="stat-total">0</p>
+                </div>
+                <div class="stat-card">
+                    <h3>Success Rate</h3>
+                    <p class="stat-value" id="stat-rate">0%</p>
+                </div>
+                <div class="stat-card">
+                    <h3>Avg Duration</h3>
+                    <p class="stat-value" id="stat-duration">0s</p>
+                </div>
+            </div>
+            <div class="type-stats" id="type-stats"></div>
+            <h3>Recent Sessions</h3>
+            <div class="session-list" id="recent-sessions"></div>
         </div>
 
         <!-- Detail Modal -->
