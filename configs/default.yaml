@@ -1,0 +1,27 @@
+anthropic:
+  api_key: ""
+  model: "claude-opus-4-7"
+
+agent:
+  max_iterations: 50
+  timeout: 10m
+  verbose: false
+
+sandbox:
+  enabled: true
+  image: "ctf-agent-sandbox:latest"
+  timeout: 60s
+  network_mode: "bridge"
+
+flag:
+  patterns:
+    - "flag\\{[^}]+\\}"
+    - "CTF\\{[^}]+\\}"
+    - "picoCTF\\{[^}]+\\}"
+    - "FLAG\\{[^}]+\\}"
+
+submit:
+  enabled: false
+  url: ""
+  method: "POST"
+  field: "flag"
