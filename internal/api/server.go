@@ -69,11 +69,14 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/stats", s.handleStats)
 
 	// WebSocket
-	s.mux.HandleFunc("/ws", s.handleWebSocket)
+	s.mux.HandleFunc("GET /ws", s.handleWebSocket)
 
 	// Static files
-	s.mux.HandleFunc("GET /", s.handleIndex)
 	s.mux.Handle("GET /static/", http.StripPrefix("/static/", http.FileServer(http.Dir("web/static"))))
+
+	// Index - must be last as it's a catch-all
+	s.mux.HandleFunc("GET /{$}", s.handleIndex)
+	s.mux.HandleFunc("GET /index.html", s.handleIndex)
 }
 
 func (s *Server) Start() error {
