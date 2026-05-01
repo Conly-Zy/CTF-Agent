@@ -32,7 +32,7 @@ var (
 )
 
 func init() {
-	serverCmd.Flags().StringVar(&serverAddr, "addr", ":8080", "服务器监听地址")
+	serverCmd.Flags().StringVar(&serverAddr, "addr", ":4399", "服务器监听地址")
 	serverCmd.Flags().StringVarP(&serverConfig, "config", "c", "config.yaml", "配置文件路径")
 	serverCmd.Flags().StringVar(&dbPath, "db", "ctf-agent.db", "数据库路径")
 
