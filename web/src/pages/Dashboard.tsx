@@ -16,7 +16,8 @@ export default function Dashboard() {
     return <div className="p-6 text-muted-foreground">加载中...</div>
   }
 
-  const { stats, sessions } = data
+  const { stats } = data
+  const sessions = data.sessions || []
   const successRate = stats.total_sessions > 0
     ? ((stats.success_sessions / stats.total_sessions) * 100).toFixed(1)
     : '0'

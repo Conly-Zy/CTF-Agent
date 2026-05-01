@@ -170,7 +170,7 @@ func (s *SQLiteStore) ListSessions(limit, offset int) ([]Session, error) {
 	}
 	defer rows.Close()
 
-	var sessions []Session
+	sessions := make([]Session, 0)
 	for rows.Next() {
 		var sess Session
 		var flag, errMsg sql.NullString
@@ -250,7 +250,7 @@ func (s *SQLiteStore) ListKnowledge(knowledgeType string, limit, offset int) ([]
 	}
 	defer rows.Close()
 
-	var items []Knowledge
+	items := make([]Knowledge, 0)
 	for rows.Next() {
 		var k Knowledge
 		if err := rows.Scan(&k.ID, &k.SessionID, &k.Title, &k.Content, &k.Type, &k.CreatedAt); err != nil {
@@ -274,7 +274,7 @@ func (s *SQLiteStore) SearchKnowledge(keyword string, limit int) ([]Knowledge, e
 	}
 	defer rows.Close()
 
-	var items []Knowledge
+	items := make([]Knowledge, 0)
 	for rows.Next() {
 		var k Knowledge
 		if err := rows.Scan(&k.ID, &k.SessionID, &k.Title, &k.Content, &k.Type, &k.CreatedAt); err != nil {
@@ -344,7 +344,7 @@ func (s *SQLiteStore) ListTags() ([]Tag, error) {
 	}
 	defer rows.Close()
 
-	var tags []Tag
+	tags := make([]Tag, 0)
 	for rows.Next() {
 		var t Tag
 		if err := rows.Scan(&t.ID, &t.Name); err != nil {
