@@ -1,14 +1,18 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/Conly-Zy/CTF-Agent/internal/agent"
+	"github.com/Conly-Zy/CTF-Agent/internal/config"
 	"github.com/Conly-Zy/CTF-Agent/internal/knowledge"
 	"github.com/Conly-Zy/CTF-Agent/internal/store"
 	"github.com/Conly-Zy/CTF-Agent/internal/tools"
@@ -16,13 +20,20 @@ import (
 )
 
 type Server struct {
-	store       *store.SQLiteStore
-	logger      *slog.Logger
-	mux         *http.ServeMux
-	addr        string
+	store        *store.SQLiteStore
+	logger       *slog.Logger
+	mux          *http.ServeMux
+	addr         string
 	orchestrator *agent.Orchestrator
-	extractor   *knowledge.Extractor
-	registry    *tools.Registry
+	extractor    *knowledge.Extractor
+	registry     *tools.Registry
+	cfg          *config.Config
+
+	// Embedded frontend
+	frontendFS fs.FS
+
+	// Session management
+	activeSessions *SessionManager
 
 	// WebSocket clients
 	wsClients map[*websocket.Conn]bool
@@ -35,12 +46,13 @@ var upgrader = websocket.Upgrader{
 
 func NewServer(store *store.SQLiteStore, logger *slog.Logger, addr string) *Server {
 	s := &Server{
-		store:     store,
-		logger:    logger,
-		mux:       http.NewServeMux(),
-		addr:      addr,
-		extractor: knowledge.NewExtractor(store),
-		wsClients: make(map[*websocket.Conn]bool),
+		store:          store,
+		logger:         logger,
+		mux:            http.NewServeMux(),
+		addr:           addr,
+		extractor:      knowledge.NewExtractor(store),
+		activeSessions: NewSessionManager(),
+		wsClients:      make(map[*websocket.Conn]bool),
 	}
 
 	s.routes()
@@ -55,28 +67,69 @@ func (s *Server) SetRegistry(r *tools.Registry) {
 	s.registry = r
 }
 
+func (s *Server) SetConfig(cfg *config.Config) {
+	s.cfg = cfg
+}
+
+func (s *Server) SetFrontendFS(fsys fs.FS) {
+	s.frontendFS = fsys
+	s.routes() // re-register routes with frontend
+}
+
 func (s *Server) routes() {
+	s.mux = http.NewServeMux()
+
 	// API routes
 	s.mux.HandleFunc("GET /api/dashboard", s.handleDashboard)
 	s.mux.HandleFunc("GET /api/sessions", s.handleListSessions)
 	s.mux.HandleFunc("GET /api/sessions/{id}", s.handleGetSession)
 	s.mux.HandleFunc("GET /api/sessions/{id}/messages", s.handleGetSessionMessages)
 	s.mux.HandleFunc("POST /api/solve", s.handleSolve)
+	s.mux.HandleFunc("POST /api/sessions/{id}/stop", s.handleStopSession)
+	s.mux.HandleFunc("POST /api/sessions/{id}/pause", s.handlePauseSession)
+	s.mux.HandleFunc("POST /api/sessions/{id}/resume", s.handleResumeSession)
+	s.mux.HandleFunc("POST /api/sessions/{id}/inject", s.handleInjectMessage)
 	s.mux.HandleFunc("GET /api/knowledge", s.handleListKnowledge)
 	s.mux.HandleFunc("GET /api/knowledge/{id}", s.handleGetKnowledge)
 	s.mux.HandleFunc("GET /api/knowledge/search", s.handleSearchKnowledge)
 	s.mux.HandleFunc("GET /api/tags", s.handleListTags)
 	s.mux.HandleFunc("GET /api/stats", s.handleStats)
+	s.mux.HandleFunc("GET /api/config", s.handleGetConfig)
+	s.mux.HandleFunc("PUT /api/config", s.handleUpdateConfig)
 
 	// WebSocket
 	s.mux.HandleFunc("GET /ws", s.handleWebSocket)
 
-	// Static files
-	s.mux.Handle("GET /static/", http.StripPrefix("/static/", http.FileServer(http.Dir("web/static"))))
-
-	// Index - must be last as it's a catch-all
-	s.mux.HandleFunc("GET /{$}", s.handleIndex)
-	s.mux.HandleFunc("GET /index.html", s.handleIndex)
+	if s.frontendFS != nil {
+		// Serve embedded frontend
+		distFS, err := fs.Sub(s.frontendFS, "dist")
+		if err != nil {
+			s.logger.Error("failed to load frontend fs", "error", err)
+		} else {
+			fileServer := http.FileServer(http.FS(distFS))
+			s.mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+				// Try to serve static file first
+				path := strings.TrimPrefix(r.URL.Path, "/")
+				if path == "" {
+					path = "index.html"
+				}
+				// Check if file exists in the embedded FS
+				if f, err := distFS.Open(path); err == nil {
+					f.Close()
+					fileServer.ServeHTTP(w, r)
+					return
+				}
+				// SPA fallback: serve index.html for any non-file path
+				r.URL.Path = "/"
+				fileServer.ServeHTTP(w, r)
+			})
+		}
+	} else {
+		// Dev mode: serve from filesystem
+		s.mux.Handle("GET /static/", http.StripPrefix("/static/", http.FileServer(http.Dir("web/static"))))
+		s.mux.HandleFunc("GET /{$}", s.handleIndex)
+		s.mux.HandleFunc("GET /index.html", s.handleIndex)
+	}
 }
 
 func (s *Server) Start() error {
@@ -172,7 +225,7 @@ func (s *Server) solveAsync(sess *store.Session, req struct {
 	s.broadcast(map[string]any{
 		"type":    "log",
 		"level":   "info",
-		"message": fmt.Sprintf("Starting session #%d", sess.ID),
+		"message": fmt.Sprintf("会话 #%d 开始解题", sess.ID),
 	})
 
 	if s.orchestrator == nil {
@@ -183,10 +236,24 @@ func (s *Server) solveAsync(sess *store.Session, req struct {
 		return
 	}
 
+	// Create cancellable context and register with session manager
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	active := s.activeSessions.Register(sess.ID, cancel)
+	defer s.activeSessions.Remove(sess.ID)
+
+	controls := &agent.SessionControls{
+		PauseCh:  active.PauseCh,
+		ResumeCh: active.ResumeCh,
+		InjectCh: active.InjectCh,
+	}
+
 	// Create a logger that broadcasts to WebSocket
 	wsLogger := &wsLogger{server: s}
 
-	result, err := s.orchestrator.SolveWithCallback(
+	result, err := s.orchestrator.SolveWithControls(
+		ctx,
 		agent.SolveRequest{
 			ChallengeType: req.ChallengeType,
 			Description:   req.Description,
@@ -194,6 +261,7 @@ func (s *Server) solveAsync(sess *store.Session, req struct {
 			Files:         req.Files,
 		},
 		wsLogger,
+		controls,
 	)
 
 	if err != nil {
@@ -292,6 +360,84 @@ func (s *Server) handleGetSessionMessages(w http.ResponseWriter, r *http.Request
 	s.writeJSON(w, messages)
 }
 
+// Session control handlers
+
+func (s *Server) handleStopSession(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		s.writeError(w, http.StatusBadRequest, fmt.Errorf("invalid id"))
+		return
+	}
+
+	if err := s.activeSessions.Stop(id); err != nil {
+		s.writeError(w, http.StatusNotFound, err)
+		return
+	}
+
+	s.broadcast(map[string]any{"type": "log", "level": "info", "message": fmt.Sprintf("会话 #%d 已停止", id)})
+	s.writeJSON(w, map[string]any{"ok": true})
+}
+
+func (s *Server) handlePauseSession(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		s.writeError(w, http.StatusBadRequest, fmt.Errorf("invalid id"))
+		return
+	}
+
+	if err := s.activeSessions.Pause(id); err != nil {
+		s.writeError(w, http.StatusConflict, err)
+		return
+	}
+
+	s.broadcast(map[string]any{"type": "log", "level": "info", "message": fmt.Sprintf("会话 #%d 已暂停", id)})
+	s.writeJSON(w, map[string]any{"ok": true})
+}
+
+func (s *Server) handleResumeSession(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		s.writeError(w, http.StatusBadRequest, fmt.Errorf("invalid id"))
+		return
+	}
+
+	if err := s.activeSessions.Resume(id); err != nil {
+		s.writeError(w, http.StatusConflict, err)
+		return
+	}
+
+	s.broadcast(map[string]any{"type": "log", "level": "info", "message": fmt.Sprintf("会话 #%d 已恢复", id)})
+	s.writeJSON(w, map[string]any{"ok": true})
+}
+
+func (s *Server) handleInjectMessage(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		s.writeError(w, http.StatusBadRequest, fmt.Errorf("invalid id"))
+		return
+	}
+
+	var req struct {
+		Message string `json:"message"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if req.Message == "" {
+		s.writeError(w, http.StatusBadRequest, fmt.Errorf("message is required"))
+		return
+	}
+
+	if err := s.activeSessions.InjectMessage(id, req.Message); err != nil {
+		s.writeError(w, http.StatusConflict, err)
+		return
+	}
+
+	s.broadcast(map[string]any{"type": "log", "level": "info", "message": fmt.Sprintf("会话 #%d 收到手动消息", id)})
+	s.writeJSON(w, map[string]any{"ok": true})
+}
+
 func (s *Server) handleListKnowledge(w http.ResponseWriter, r *http.Request) {
 	knowledgeType := r.URL.Query().Get("type")
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
@@ -370,6 +516,43 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.writeJSON(w, stats)
+}
+
+// Config handlers
+func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
+	if s.cfg == nil {
+		s.writeError(w, http.StatusInternalServerError, fmt.Errorf("config not available"))
+		return
+	}
+	s.cfg.SyncTimeoutSec()
+	s.writeJSON(w, s.cfg)
+}
+
+func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
+	if s.cfg == nil {
+		s.writeError(w, http.StatusInternalServerError, fmt.Errorf("config not available"))
+		return
+	}
+
+	var incoming config.Config
+	if err := json.NewDecoder(r.Body).Decode(&incoming); err != nil {
+		s.writeError(w, http.StatusBadRequest, err)
+		return
+	}
+
+	// Update config in place
+	s.cfg.Anthropic = incoming.Anthropic
+	s.cfg.Agent = incoming.Agent
+	s.cfg.Sandbox = incoming.Sandbox
+	s.cfg.Flag = incoming.Flag
+	s.cfg.Submit = incoming.Submit
+
+	if err := s.cfg.Save(); err != nil {
+		s.writeError(w, http.StatusInternalServerError, fmt.Errorf("save config: %w", err))
+		return
+	}
+
+	s.writeJSON(w, map[string]any{"ok": true})
 }
 
 func (s *Server) writeJSON(w http.ResponseWriter, data any) {

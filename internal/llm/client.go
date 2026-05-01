@@ -29,14 +29,7 @@ func NewClient(apiKey string, model string) (*Client, error) {
 }
 
 func (c *Client) CreateMessage(ctx context.Context, params MessageParams) (*MessageResponse, error) {
-	messages := make([]anthropic.MessageParam, len(params.Messages))
-	for i, msg := range params.Messages {
-		if msg.Role == "user" {
-			messages[i] = anthropic.NewUserMessage(anthropic.NewTextBlock(msg.Content))
-		} else {
-			messages[i] = anthropic.NewAssistantMessage(anthropic.NewTextBlock(msg.Content))
-		}
-	}
+	messages := convertMessages(params.Messages)
 
 	tools := make([]anthropic.ToolUnionParam, len(params.Tools))
 	for i, tool := range params.Tools {
@@ -75,14 +68,7 @@ func (c *Client) CreateMessage(ctx context.Context, params MessageParams) (*Mess
 }
 
 func (c *Client) CreateMessageStream(ctx context.Context, params MessageParams, writer io.Writer) (*MessageResponse, error) {
-	messages := make([]anthropic.MessageParam, len(params.Messages))
-	for i, msg := range params.Messages {
-		if msg.Role == "user" {
-			messages[i] = anthropic.NewUserMessage(anthropic.NewTextBlock(msg.Content))
-		} else {
-			messages[i] = anthropic.NewAssistantMessage(anthropic.NewTextBlock(msg.Content))
-		}
-	}
+	messages := convertMessages(params.Messages)
 
 	tools := make([]anthropic.ToolUnionParam, len(params.Tools))
 	for i, tool := range params.Tools {
@@ -131,6 +117,54 @@ func (c *Client) CreateMessageStream(ctx context.Context, params MessageParams, 
 	finalMsg = stream.Current().Message
 
 	return convertResponse(&finalMsg), nil
+}
+
+// convertMessages converts our Message type to Anthropic SDK message params,
+// properly handling text, tool_use, and tool_result content blocks.
+func convertMessages(msgs []Message) []anthropic.MessageParam {
+	var result []anthropic.MessageParam
+
+	for _, msg := range msgs {
+		switch content := msg.Content.(type) {
+		case string:
+			// Simple text message
+			if msg.Role == "user" {
+				result = append(result, anthropic.NewUserMessage(anthropic.NewTextBlock(content)))
+			} else {
+				result = append(result, anthropic.NewAssistantMessage(anthropic.NewTextBlock(content)))
+			}
+
+		case []ContentBlock:
+			if msg.Role == "assistant" {
+				var blocks []anthropic.ContentBlockParamUnion
+				for _, b := range content {
+					switch b.Type {
+					case "text":
+						blocks = append(blocks, anthropic.NewTextBlock(b.Text))
+					case "tool_use":
+						var inputMap map[string]any
+						json.Unmarshal(b.Input, &inputMap)
+						blocks = append(blocks, anthropic.NewToolUseBlock(b.ID, inputMap, b.Name))
+					}
+				}
+				result = append(result, anthropic.NewAssistantMessage(blocks...))
+
+			} else if msg.Role == "user" {
+				var blocks []anthropic.ContentBlockParamUnion
+				for _, b := range content {
+					switch b.Type {
+					case "tool_result":
+						blocks = append(blocks, anthropic.NewToolResultBlock(b.ToolUseID, b.Content, b.IsError))
+					case "text":
+						blocks = append(blocks, anthropic.NewTextBlock(b.Text))
+					}
+				}
+				result = append(result, anthropic.NewUserMessage(blocks...))
+			}
+		}
+	}
+
+	return result
 }
 
 func convertSchema(schema map[string]any) anthropic.ToolInputSchemaParam {

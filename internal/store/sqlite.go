@@ -445,6 +445,42 @@ func (s *SQLiteStore) GetStats() (*SessionStats, error) {
 	return stats, nil
 }
 
+// KnowledgeStore implements agent.KnowledgeStore interface.
+func (s *SQLiteStore) SearchKnowledgeByType(challengeType string, limit int) ([]Knowledge, error) {
+	typeMap := map[string]string{
+		"web":     "vulnerability",
+		"pwn":     "exploit",
+		"crypto":  "technique",
+		"reverse": "analysis",
+	}
+	kType, ok := typeMap[challengeType]
+	if !ok {
+		return nil, nil
+	}
+
+	rows, err := s.db.Query(
+		`SELECT id, session_id, title, content, type, created_at
+		 FROM knowledge WHERE type = ?
+		 ORDER BY created_at DESC LIMIT ?`,
+		kType, limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("search knowledge by type: %w", err)
+	}
+	defer rows.Close()
+
+	var items []Knowledge
+	for rows.Next() {
+		var k Knowledge
+		if err := rows.Scan(&k.ID, &k.SessionID, &k.Title, &k.Content, &k.Type, &k.CreatedAt); err != nil {
+			return nil, fmt.Errorf("scan knowledge: %w", err)
+		}
+		items = append(items, k)
+	}
+
+	return items, nil
+}
+
 // Helper
 
 func ToJSON(v any) string {

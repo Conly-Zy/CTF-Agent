@@ -9,40 +9,43 @@ import (
 )
 
 type Config struct {
-	Anthropic AnthropicConfig `yaml:"anthropic"`
-	Agent     AgentConfig     `yaml:"agent"`
-	Sandbox   SandboxConfig   `yaml:"sandbox"`
-	Flag      FlagConfig      `yaml:"flag"`
-	Submit    SubmitConfig    `yaml:"submit"`
+	Anthropic AnthropicConfig `yaml:"anthropic" json:"anthropic"`
+	Agent     AgentConfig     `yaml:"agent" json:"agent"`
+	Sandbox   SandboxConfig   `yaml:"sandbox" json:"sandbox"`
+	Flag      FlagConfig      `yaml:"flag" json:"flag"`
+	Submit    SubmitConfig    `yaml:"submit" json:"submit"`
+	path      string          `yaml:"-" json:"-"`
 }
 
 type AnthropicConfig struct {
-	APIKey string `yaml:"api_key"`
-	Model  string `yaml:"model"`
+	APIKey string `yaml:"api_key" json:"api_key"`
+	Model  string `yaml:"model" json:"model"`
 }
 
 type AgentConfig struct {
-	MaxIterations int           `yaml:"max_iterations"`
-	Timeout       time.Duration `yaml:"timeout"`
-	Verbose       bool          `yaml:"verbose"`
+	MaxIterations int           `yaml:"max_iterations" json:"max_iterations"`
+	Timeout       time.Duration `yaml:"timeout" json:"-"`
+	TimeoutSec    int           `yaml:"-" json:"timeout_seconds"`
+	Verbose       bool          `yaml:"verbose" json:"verbose"`
 }
 
 type SandboxConfig struct {
-	Enabled    bool          `yaml:"enabled"`
-	Image      string        `yaml:"image"`
-	Timeout    time.Duration `yaml:"timeout"`
-	NetworkMode string       `yaml:"network_mode"`
+	Enabled     bool          `yaml:"enabled" json:"enabled"`
+	Image       string        `yaml:"image" json:"image"`
+	Timeout     time.Duration `yaml:"timeout" json:"-"`
+	TimeoutSec  int           `yaml:"-" json:"timeout_seconds"`
+	NetworkMode string        `yaml:"network_mode" json:"network_mode"`
 }
 
 type FlagConfig struct {
-	Patterns []string `yaml:"patterns"`
+	Patterns []string `yaml:"patterns" json:"patterns"`
 }
 
 type SubmitConfig struct {
-	Enabled bool   `yaml:"enabled"`
-	URL     string `yaml:"url"`
-	Method  string `yaml:"method"`
-	Field   string `yaml:"field"`
+	Enabled bool   `yaml:"enabled" json:"enabled"`
+	URL     string `yaml:"url" json:"url"`
+	Method  string `yaml:"method" json:"method"`
+	Field   string `yaml:"field" json:"field"`
 }
 
 func DefaultConfig() *Config {
@@ -78,6 +81,7 @@ func DefaultConfig() *Config {
 
 func Load(path string) (*Config, error) {
 	cfg := DefaultConfig()
+	cfg.path = path
 
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -94,7 +98,34 @@ func Load(path string) (*Config, error) {
 		cfg.Anthropic.APIKey = envKey
 	}
 
+	cfg.SyncTimeoutSec()
 	return cfg, nil
+}
+
+func (c *Config) SyncTimeoutSec() {
+	c.Agent.TimeoutSec = int(c.Agent.Timeout.Seconds())
+	c.Sandbox.TimeoutSec = int(c.Sandbox.Timeout.Seconds())
+}
+
+func (c *Config) applyTimeoutSec() {
+	if c.Agent.TimeoutSec > 0 {
+		c.Agent.Timeout = time.Duration(c.Agent.TimeoutSec) * time.Second
+	}
+	if c.Sandbox.TimeoutSec > 0 {
+		c.Sandbox.Timeout = time.Duration(c.Sandbox.TimeoutSec) * time.Second
+	}
+}
+
+func (c *Config) Save() error {
+	if c.path == "" {
+		return fmt.Errorf("no config path set")
+	}
+	c.applyTimeoutSec()
+	data, err := yaml.Marshal(c)
+	if err != nil {
+		return fmt.Errorf("marshal config: %w", err)
+	}
+	return os.WriteFile(c.path, data, 0644)
 }
 
 func (c *Config) Validate() error {

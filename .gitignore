@@ -1,5 +1,5 @@
 # Binaries
-ctf-agent
+/ctf-agent
 *.exe
 *.exe~
 *.dll
@@ -29,7 +29,14 @@ config.local.yaml
 # Build artifacts
 /bin/
 /dist/
+web/dist/
+web/node_modules/
+cmd/ctf-agent/web_dist/
 
 # Temporary files
 *.tmp
 *.log
+*.tsbuildinfo
+
+# Database
+*.db

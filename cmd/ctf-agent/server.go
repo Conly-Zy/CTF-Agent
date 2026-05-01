@@ -1,10 +1,10 @@
 package main
 
 import (
+	"embed"
 	"fmt"
 	"log/slog"
 	"os"
-	"time"
 
 	"github.com/Conly-Zy/CTF-Agent/internal/agent"
 	"github.com/Conly-Zy/CTF-Agent/internal/api"
@@ -12,14 +12,16 @@ import (
 	"github.com/Conly-Zy/CTF-Agent/internal/llm"
 	"github.com/Conly-Zy/CTF-Agent/internal/store"
 	"github.com/Conly-Zy/CTF-Agent/internal/tools"
-	"github.com/Conly-Zy/CTF-Agent/internal/tools/common"
 	"github.com/spf13/cobra"
 )
 
+//go:embed all:web_dist
+var frontendFS embed.FS
+
 var serverCmd = &cobra.Command{
 	Use:   "server",
-	Short: "Start the web server",
-	Long:  "Start the HTTP API server with web interface",
+	Short: "启动 Web 服务器",
+	Long:  "启动 HTTP API 服务器和 Web 界面",
 	RunE:  runServer,
 }
 
@@ -30,9 +32,9 @@ var (
 )
 
 func init() {
-	serverCmd.Flags().StringVar(&serverAddr, "addr", ":8080", "Server address")
-	serverCmd.Flags().StringVarP(&serverConfig, "config", "c", "", "Config file path")
-	serverCmd.Flags().StringVar(&dbPath, "db", "ctf-agent.db", "Database path")
+	serverCmd.Flags().StringVar(&serverAddr, "addr", ":8080", "服务器监听地址")
+	serverCmd.Flags().StringVarP(&serverConfig, "config", "c", "config.yaml", "配置文件路径")
+	serverCmd.Flags().StringVar(&dbPath, "db", "ctf-agent.db", "数据库路径")
 
 	rootCmd.AddCommand(serverCmd)
 }
@@ -55,9 +57,11 @@ func runServer(cmd *cobra.Command, args []string) error {
 
 	// Initialize tools
 	registry := tools.NewRegistry()
-	registry.Register(common.NewFileReadTool())
-	registry.Register(common.NewFileWriteTool())
-	registry.Register(common.NewShellExecTool(30 * time.Second))
+	registerCommonTools(registry)
+	registerWebTools(registry)
+	registerPwnTools(registry)
+	registerCryptoTools(registry)
+	registerReverseTools(registry)
 
 	// Initialize LLM client
 	llmClient, err := llm.NewClient(cfg.Anthropic.APIKey, cfg.Anthropic.Model)
@@ -69,6 +73,8 @@ func runServer(cmd *cobra.Command, args []string) error {
 	var orch *agent.Orchestrator
 	if llmClient != nil {
 		orch = agent.NewOrchestrator(llmClient, registry, logger, cfg.Agent.MaxIterations, cfg.Agent.Timeout)
+		orch.SetFlagPatterns(cfg.Flag.Patterns)
+		orch.SetKnowledgeStore(&knowledgeAdapter{store: db})
 	}
 
 	// Create server
@@ -77,6 +83,15 @@ func runServer(cmd *cobra.Command, args []string) error {
 		server.SetOrchestrator(orch)
 	}
 	server.SetRegistry(registry)
+	server.SetConfig(cfg)
+
+	// Try to use embedded frontend, fallback to filesystem
+	if _, err := frontendFS.Open("web_dist"); err == nil {
+		server.SetFrontendFS(frontendFS)
+		logger.Info("using embedded frontend")
+	} else {
+		logger.Info("using filesystem frontend (dev mode)")
+	}
 
 	fmt.Printf("Starting CTF-Agent web server...\n")
 	fmt.Printf("Address: %s\n", serverAddr)

@@ -9,9 +9,42 @@ type MessageParams struct {
 	MaxTokens    int
 }
 
+// Message supports structured content blocks for proper tool_use/tool_result flow.
 type Message struct {
 	Role    string
-	Content string
+	Content any // string, []ContentBlock, or nil
+}
+
+// ContentBlock represents a block in a message (text, tool_use, or tool_result).
+type ContentBlock struct {
+	Type      string          `json:"type"`
+	Text      string          `json:"text,omitempty"`
+	ID        string          `json:"id,omitempty"`
+	Name      string          `json:"name,omitempty"`
+	Input     json.RawMessage `json:"input,omitempty"`
+	ToolUseID string          `json:"tool_use_id,omitempty"`
+	Content   string          `json:"content,omitempty"`
+	IsError   bool            `json:"is_error,omitempty"`
+}
+
+// NewTextMessage creates a simple text message.
+func NewTextMessage(role, text string) Message {
+	return Message{Role: role, Content: text}
+}
+
+// NewToolUseMessage creates an assistant message with tool_use blocks.
+func NewToolUseMessage(text string, toolUses []ContentBlock) Message {
+	var blocks []ContentBlock
+	if text != "" {
+		blocks = append(blocks, ContentBlock{Type: "text", Text: text})
+	}
+	blocks = append(blocks, toolUses...)
+	return Message{Role: "assistant", Content: blocks}
+}
+
+// NewToolResultMessage creates a user message with tool_result blocks.
+func NewToolResultMessage(results []ContentBlock) Message {
+	return Message{Role: "user", Content: results}
 }
 
 type ToolDefinition struct {
@@ -26,21 +59,14 @@ type MessageResponse struct {
 	StopReason string
 }
 
-type ContentBlock struct {
-	Type  string
-	Text  string
-	ID    string
-	Name  string
-	Input json.RawMessage
-}
-
 func (r *MessageResponse) GetText() string {
+	var text string
 	for _, block := range r.Content {
 		if block.Type == "text" {
-			return block.Text
+			text += block.Text
 		}
 	}
-	return ""
+	return text
 }
 
 func (r *MessageResponse) GetToolUse() []ContentBlock {
