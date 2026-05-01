@@ -4,9 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/fs"
 	"log/slog"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,6 +31,7 @@ type Server struct {
 	extractor    *knowledge.Extractor
 	registry     *tools.Registry
 	cfg          *config.Config
+	uploadDir    string
 
 	// Embedded frontend
 	frontendFS fs.FS
@@ -46,6 +50,9 @@ var upgrader = websocket.Upgrader{
 }
 
 func NewServer(store *store.SQLiteStore, logger *slog.Logger, addr string) *Server {
+	uploadDir := filepath.Join(os.TempDir(), "ctf-agent-uploads")
+	os.MkdirAll(uploadDir, 0755)
+
 	s := &Server{
 		store:          store,
 		logger:         logger,
@@ -54,6 +61,7 @@ func NewServer(store *store.SQLiteStore, logger *slog.Logger, addr string) *Serv
 		extractor:      knowledge.NewExtractor(store),
 		activeSessions: NewSessionManager(),
 		wsClients:      make(map[*websocket.Conn]bool),
+		uploadDir:      uploadDir,
 	}
 
 	s.routes()
@@ -86,10 +94,14 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/sessions/{id}", s.handleGetSession)
 	s.mux.HandleFunc("GET /api/sessions/{id}/messages", s.handleGetSessionMessages)
 	s.mux.HandleFunc("POST /api/solve", s.handleSolve)
+	s.mux.HandleFunc("POST /api/upload", s.handleUpload)
 	s.mux.HandleFunc("POST /api/sessions/{id}/stop", s.handleStopSession)
 	s.mux.HandleFunc("POST /api/sessions/{id}/pause", s.handlePauseSession)
 	s.mux.HandleFunc("POST /api/sessions/{id}/resume", s.handleResumeSession)
 	s.mux.HandleFunc("POST /api/sessions/{id}/inject", s.handleInjectMessage)
+	s.mux.HandleFunc("GET /api/sessions/{id}/export", s.handleExportSession)
+	s.mux.HandleFunc("GET /api/tools", s.handleListTools)
+	s.mux.HandleFunc("POST /api/tools/{name}/test", s.handleTestTool)
 	s.mux.HandleFunc("GET /api/knowledge", s.handleListKnowledge)
 	s.mux.HandleFunc("GET /api/knowledge/{id}", s.handleGetKnowledge)
 	s.mux.HandleFunc("GET /api/knowledge/search", s.handleSearchKnowledge)
@@ -455,6 +467,79 @@ func (s *Server) handleInjectMessage(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, map[string]any{"ok": true})
 }
 
+func (s *Server) handleExportSession(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		s.writeError(w, http.StatusBadRequest, fmt.Errorf("invalid id"))
+		return
+	}
+
+	session, err := s.store.GetSession(id)
+	if err != nil {
+		s.writeError(w, http.StatusNotFound, fmt.Errorf("session not found"))
+		return
+	}
+
+	messages, err := s.store.GetConversationMessages(id)
+	if err != nil {
+		s.writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	format := r.URL.Query().Get("format")
+	if format == "" {
+		format = "markdown"
+	}
+
+	switch format {
+	case "json":
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"session-%d.json\"", id))
+		json.NewEncoder(w).Encode(map[string]any{
+			"session":  session,
+			"messages": messages,
+		})
+	case "markdown":
+		w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
+		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"session-%d.md\"", id))
+		fmt.Fprintf(w, "# CTF 解题记录 #%d\n\n", id)
+		fmt.Fprintf(w, "- **类型**: %s\n", session.ChallengeType)
+		fmt.Fprintf(w, "- **状态**: %s\n", session.Status)
+		fmt.Fprintf(w, "- **迭代次数**: %d\n", session.Iterations)
+		if session.Flag != "" {
+			fmt.Fprintf(w, "- **Flag**: `%s`\n", session.Flag)
+		}
+		fmt.Fprintf(w, "- **创建时间**: %s\n\n", session.CreatedAt.Format("2006-01-02 15:04:05"))
+		if session.Description != "" {
+			fmt.Fprintf(w, "## 题目描述\n\n%s\n\n", session.Description)
+		}
+		if session.Target != "" {
+			fmt.Fprintf(w, "## 目标\n\n%s\n\n", session.Target)
+		}
+		fmt.Fprintf(w, "## 对话记录\n\n")
+		for _, msg := range messages {
+			role := "用户"
+			if msg.Role == "assistant" {
+				role = "AI"
+			}
+			fmt.Fprintf(w, "### %s\n\n", role)
+			if msg.ToolName != "" {
+				fmt.Fprintf(w, "**工具调用**: `%s`\n\n", msg.ToolName)
+			}
+			content := msg.Content
+			if content == "" && msg.ToolInput != "" {
+				content = msg.ToolInput
+			}
+			if content != "" {
+				fmt.Fprintf(w, "%s\n\n", content)
+			}
+			fmt.Fprintf(w, "---\n\n")
+		}
+	default:
+		s.writeError(w, http.StatusBadRequest, fmt.Errorf("unsupported format: %s", format))
+	}
+}
+
 func (s *Server) handleListKnowledge(w http.ResponseWriter, r *http.Request) {
 	knowledgeType := r.URL.Query().Get("type")
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
@@ -570,6 +655,96 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.writeJSON(w, map[string]any{"ok": true})
+}
+
+// Tools handlers
+func (s *Server) handleListTools(w http.ResponseWriter, r *http.Request) {
+	if s.registry == nil {
+		s.writeJSON(w, []any{})
+		return
+	}
+
+	tools := s.registry.ToClaudeTools()
+	s.writeJSON(w, tools)
+}
+
+func (s *Server) handleTestTool(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if s.registry == nil {
+		s.writeError(w, http.StatusInternalServerError, fmt.Errorf("registry not available"))
+		return
+	}
+
+	tool, ok := s.registry.Get(name)
+	if !ok {
+		s.writeError(w, http.StatusNotFound, fmt.Errorf("tool not found: %s", name))
+		return
+	}
+
+	var req struct {
+		Input json.RawMessage `json:"input"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.writeError(w, http.StatusBadRequest, err)
+		return
+	}
+
+	output, err := tool.Execute(r.Context(), req.Input)
+	if err != nil {
+		s.writeJSON(w, map[string]any{
+			"output": "",
+			"error":  err.Error(),
+		})
+		return
+	}
+
+	s.writeJSON(w, map[string]any{
+		"output": output,
+		"error":  "",
+	})
+}
+
+// File upload handler
+func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
+	r.ParseMultipartForm(32 << 20) // 32 MB max
+
+	file, handler, err := r.FormFile("file")
+	if err != nil {
+		s.writeError(w, http.StatusBadRequest, fmt.Errorf("missing file"))
+		return
+	}
+	defer file.Close()
+
+	// Create session-specific directory
+	sessionID := r.FormValue("session_id")
+	var destDir string
+	if sessionID != "" {
+		destDir = filepath.Join(s.uploadDir, sessionID)
+	} else {
+		destDir = filepath.Join(s.uploadDir, "temp")
+	}
+	os.MkdirAll(destDir, 0755)
+
+	// Save file
+	destPath := filepath.Join(destDir, filepath.Base(handler.Filename))
+	dst, err := os.Create(destPath)
+	if err != nil {
+		s.writeError(w, http.StatusInternalServerError, fmt.Errorf("create file: %w", err))
+		return
+	}
+	defer dst.Close()
+
+	if _, err := io.Copy(dst, file); err != nil {
+		s.writeError(w, http.StatusInternalServerError, fmt.Errorf("save file: %w", err))
+		return
+	}
+
+	s.logger.Info("file uploaded", "name", handler.Filename, "size", handler.Size, "path", destPath)
+	s.writeJSON(w, map[string]any{
+		"path": destPath,
+		"name": handler.Filename,
+		"size": handler.Size,
+	})
 }
 
 func (s *Server) writeJSON(w http.ResponseWriter, data any) {

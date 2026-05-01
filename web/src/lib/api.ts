@@ -12,6 +12,23 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return res.json()
 }
 
+export interface UploadResult {
+  path: string
+  name: string
+  size: number
+}
+
+export interface ToolInfo {
+  name: string
+  description: string
+  input_schema: Record<string, unknown>
+}
+
+export interface ToolTestResult {
+  output: string
+  error: string
+}
+
 // Dashboard
 export interface DashboardData {
   stats: {
@@ -85,6 +102,16 @@ export const api = {
 
   getSessionMessages: (id: number) => request<ConversationMessage[]>(`/api/sessions/${id}/messages`),
 
+  exportSession: (id: number, format: 'json' | 'markdown' = 'markdown') => {
+    const url = `${BASE}/api/sessions/${id}/export?format=${format}`
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `session-${id}.${format === 'markdown' ? 'md' : 'json'}`
+    document.body.appendChild(a)
+    a.click()
+    document.body.removeChild(a)
+  },
+
   solve: (data: { challenge_type: string; description: string; target: string; files: string[] }) =>
     request<{ session_id: number; status: string }>('/api/solve', {
       method: 'POST',
@@ -126,5 +153,29 @@ export const api = {
     request<{ ok: boolean }>('/api/config', {
       method: 'PUT',
       body: JSON.stringify(data),
+    }),
+
+  uploadFile: async (file: File, sessionId?: string): Promise<UploadResult> => {
+    const formData = new FormData()
+    formData.append('file', file)
+    if (sessionId) formData.append('session_id', sessionId)
+
+    const res = await fetch(`${BASE}/api/upload`, {
+      method: 'POST',
+      body: formData,
+    })
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}))
+      throw new Error(body.error || `上传失败: ${res.status}`)
+    }
+    return res.json()
+  },
+
+  getTools: () => request<ToolInfo[]>('/api/tools'),
+
+  testTool: (name: string, input: Record<string, unknown>) =>
+    request<ToolTestResult>(`/api/tools/${name}/test`, {
+      method: 'POST',
+      body: JSON.stringify({ input }),
     }),
 }

@@ -1,9 +1,10 @@
 import { Routes, Route, NavLink, Navigate } from 'react-router-dom'
-import { LayoutDashboard, Terminal, History, BookOpen, Settings } from 'lucide-react'
+import { LayoutDashboard, Terminal, History, BookOpen, Settings, Wrench } from 'lucide-react'
 import Dashboard from '@/pages/Dashboard'
 import Solve from '@/pages/Solve'
 import Sessions from '@/pages/Sessions'
 import Knowledge from '@/pages/Knowledge'
+import Tools from '@/pages/Tools'
 import SettingsPage from '@/pages/Settings'
 
 const navItems = [
@@ -11,6 +12,7 @@ const navItems = [
   { to: '/solve', icon: Terminal, label: '解题' },
   { to: '/sessions', icon: History, label: '会话记录' },
   { to: '/knowledge', icon: BookOpen, label: '知识库' },
+  { to: '/tools', icon: Wrench, label: '工具' },
   { to: '/settings', icon: Settings, label: '设置' },
 ]
 
@@ -50,6 +52,7 @@ export default function App() {
           <Route path="/solve" element={<Solve />} />
           <Route path="/sessions" element={<Sessions />} />
           <Route path="/knowledge" element={<Knowledge />} />
+          <Route path="/tools" element={<Tools />} />
           <Route path="/settings" element={<SettingsPage />} />
         </Routes>
       </main>

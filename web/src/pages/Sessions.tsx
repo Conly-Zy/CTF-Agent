@@ -2,9 +2,11 @@ import { useEffect, useState } from 'react'
 import { api, Session, ConversationMessage } from '@/lib/api'
 import { Card, CardContent } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
 import { Select } from '@/components/ui/select'
 import { Dialog, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { challengeTypeLabel, statusLabel, formatDuration, formatDate } from '@/lib/utils'
+import { Download } from 'lucide-react'
 
 export default function Sessions() {
   const [sessions, setSessions] = useState<Session[]>([])
@@ -90,7 +92,27 @@ export default function Sessions() {
         {selected && (
           <>
             <DialogHeader>
-              <DialogTitle>会话 #{selected.id} - {challengeTypeLabel(selected.challenge_type)}</DialogTitle>
+              <div className="flex items-center justify-between">
+                <DialogTitle>会话 #{selected.id} - {challengeTypeLabel(selected.challenge_type)}</DialogTitle>
+                <div className="flex gap-1">
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => api.exportSession(selected.id, 'markdown')}
+                    title="导出 Markdown"
+                  >
+                    <Download className="h-4 w-4 mr-1" /> MD
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => api.exportSession(selected.id, 'json')}
+                    title="导出 JSON"
+                  >
+                    <Download className="h-4 w-4 mr-1" /> JSON
+                  </Button>
+                </div>
+              </div>
             </DialogHeader>
             <div className="space-y-4">
               <div className="grid grid-cols-2 gap-2 text-sm">
