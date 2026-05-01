@@ -1,0 +1,68 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    strategy:
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            suffix: ''
+          - goos: linux
+            goarch: arm64
+            suffix: ''
+          - goos: darwin
+            goarch: amd64
+            suffix: ''
+          - goos: darwin
+            goarch: arm64
+            suffix: ''
+          - goos: windows
+            goarch: amd64
+            suffix: '.exe'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: true
+
+      - name: Build frontend
+        working-directory: web
+        run: npm ci && npm run build
+
+      - name: Prepare embed directory
+        run: |
+          rm -rf cmd/ctf-agent/web_dist
+          cp -r web/dist cmd/ctf-agent/web_dist
+
+      - name: Build binary
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: |
+          BINARY=ctf-agent-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.suffix }}
+          go build -ldflags="-s -w" -o "dist/${BINARY}" ./cmd/ctf-agent
+          tar -czf "dist/ctf-agent-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz" -C dist "${BINARY}"
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/ctf-agent-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz

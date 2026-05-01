@@ -1,0 +1,60 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+          - goos: windows
+            goarch: amd64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: true
+
+      - name: Build frontend
+        working-directory: web
+        run: npm ci && npm run build
+
+      - name: Prepare embed directory
+        run: |
+          rm -rf cmd/ctf-agent/web_dist
+          cp -r web/dist cmd/ctf-agent/web_dist
+
+      - name: Build binary
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: go build -ldflags="-s -w" -o bin/ctf-agent-${{ matrix.goos }}-${{ matrix.goarch }} ./cmd/ctf-agent
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ctf-agent-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: bin/ctf-agent-*
