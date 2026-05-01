@@ -31,6 +31,7 @@ type Server struct {
 
 	// Embedded frontend
 	frontendFS fs.FS
+	spaFS      fs.FS // sub-filesystem for SPA dist
 
 	// Session management
 	activeSessions *SessionManager
@@ -101,28 +102,13 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /ws", s.handleWebSocket)
 
 	if s.frontendFS != nil {
-		// Serve embedded frontend
-		distFS, err := fs.Sub(s.frontendFS, "dist")
+		// Serve embedded frontend with SPA fallback
+		// The embed root is cmd/ctf-agent/web_dist/. Use fs.Sub to get its contents.
+		webFS, err := fs.Sub(s.frontendFS, "web_dist")
 		if err != nil {
 			s.logger.Error("failed to load frontend fs", "error", err)
 		} else {
-			fileServer := http.FileServer(http.FS(distFS))
-			s.mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-				// Try to serve static file first
-				path := strings.TrimPrefix(r.URL.Path, "/")
-				if path == "" {
-					path = "index.html"
-				}
-				// Check if file exists in the embedded FS
-				if f, err := distFS.Open(path); err == nil {
-					f.Close()
-					fileServer.ServeHTTP(w, r)
-					return
-				}
-				// SPA fallback: serve index.html for any non-file path
-				r.URL.Path = "/"
-				fileServer.ServeHTTP(w, r)
-			})
+			s.spaFS = webFS
 		}
 	} else {
 		// Dev mode: serve from filesystem
@@ -134,7 +120,38 @@ func (s *Server) routes() {
 
 func (s *Server) Start() error {
 	s.logger.Info("starting HTTP server", "addr", s.addr)
+	if s.spaFS != nil {
+		return http.ListenAndServe(s.addr, s.spaHandler())
+	}
 	return http.ListenAndServe(s.addr, s.mux)
+}
+
+// spaHandler serves the embedded SPA frontend. API/WS routes go to the mux,
+// everything else is served from the embedded filesystem with index.html fallback.
+func (s *Server) spaHandler() http.Handler {
+	fileServer := http.FileServer(http.FS(s.spaFS))
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// API and WebSocket routes go to the mux
+		if strings.HasPrefix(r.URL.Path, "/api/") || r.URL.Path == "/ws" {
+			s.mux.ServeHTTP(w, r)
+			return
+		}
+
+		// Try to serve static file from embedded FS
+		path := strings.TrimPrefix(r.URL.Path, "/")
+		if path == "" {
+			path = "index.html"
+		}
+		if f, err := s.spaFS.Open(path); err == nil {
+			f.Close()
+			fileServer.ServeHTTP(w, r)
+			return
+		}
+
+		// SPA fallback: serve index.html
+		r.URL.Path = "/"
+		fileServer.ServeHTTP(w, r)
+	})
 }
 
 // WebSocket handler
