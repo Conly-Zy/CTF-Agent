@@ -1,20 +1,33 @@
 package knowledge
 
 import (
+	"context"
 	"fmt"
+	"log/slog"
 	"regexp"
 	"strings"
 	"time"
 
+	"github.com/Conly-Zy/CTF-Agent/internal/memory"
 	"github.com/Conly-Zy/CTF-Agent/internal/store"
 )
 
 type Extractor struct {
-	store *store.SQLiteStore
+	store        *store.SQLiteStore
+	memoryMgr    *memory.MemoryManager
+	logger       *slog.Logger
 }
 
 func NewExtractor(store *store.SQLiteStore) *Extractor {
 	return &Extractor{store: store}
+}
+
+func NewExtractorWithMemory(store *store.SQLiteStore, memoryMgr *memory.MemoryManager, logger *slog.Logger) *Extractor {
+	return &Extractor{
+		store:     store,
+		memoryMgr: memoryMgr,
+		logger:    logger,
+	}
 }
 
 type ExtractionResult struct {
@@ -48,10 +61,40 @@ func (e *Extractor) ExtractFromSession(sess *store.Session, messages []store.Con
 		e.store.AddTagToKnowledge(k.ID, tag.ID)
 	}
 
+	// 存储到向量存储
+	if e.memoryMgr != nil {
+		ctx := context.Background()
+		vectorType := e.mapKnowledgeTypeToVector(knowledgeType)
+		switch vectorType {
+		case "guide":
+			e.memoryMgr.StoreGuide(ctx, title, content, tags)
+		case "answer":
+			e.memoryMgr.StoreAnswer(ctx, title, content, sess.ID, tags)
+		default:
+			e.memoryMgr.StoreCode(ctx, title, content, tags)
+		}
+		if e.logger != nil {
+			e.logger.Info("stored to vector memory",
+				"title", title,
+				"type", vectorType)
+		}
+	}
+
 	return &ExtractionResult{
 		Knowledge: k,
 		Tags:      tags,
 	}, nil
+}
+
+func (e *Extractor) mapKnowledgeTypeToVector(knowledgeType string) string {
+	switch knowledgeType {
+	case "vulnerability", "exploit":
+		return "guide"
+	case "technique":
+		return "answer"
+	default:
+		return "code"
+	}
 }
 
 func (e *Extractor) generateTitle(sess *store.Session) string {

@@ -1,0 +1,8 @@
+services:
+  ctf-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        GO_VERSION: ${GO_VERSION:-1.26.1}
+        NODE_VERSION: ${NODE_VERSION:-24}

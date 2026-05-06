@@ -1,0 +1,49 @@
+# CTF-Agent Configuration
+# Secrets are best supplied through environment variables or .env when using Docker Compose.
+
+# LLM Provider (anthropic / openai)
+llm:
+  provider: anthropic
+  api_key: ""
+  model: claude-opus-4-7
+  base_url: ""  # Optional custom API endpoint
+
+# Backward-compatible Anthropic config
+anthropic:
+  api_key: ""
+  model: claude-opus-4-7
+
+# Agent settings
+agent:
+  max_iterations: 50
+  timeout: 10m
+  verbose: false
+
+# Docker sandbox
+sandbox:
+  enabled: true
+  image: ctf-agent-sandbox:latest
+  timeout: 60s
+  network_mode: bridge
+
+# Flag matching patterns
+flag:
+  patterns:
+    - 'flag\{[^}]+\}'
+    - 'CTF\{[^}]+\}'
+    - 'picoCTF\{[^}]+\}'
+    - 'FLAG\{[^}]+\}'
+
+# Auto-submit settings
+submit:
+  enabled: false
+  url: ""
+  method: POST
+  field: flag
+
+# Auth and rate limiting
+auth:
+  enabled: false
+  api_key: ""
+  rate_limit: 10
+  rate_burst: 20

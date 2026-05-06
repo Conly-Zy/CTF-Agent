@@ -1,0 +1,30 @@
+.git
+.github
+.claude
+
+# Local runtime state and secrets
+.env
+config.yaml
+config.local.yaml
+data/
+uploads/
+logs/
+backups/
+*.db
+*.log
+
+# Build/dependency artifacts
+bin/
+dist/
+tmp/
+web/node_modules/
+web/dist/
+web/.git
+web/*.tsbuildinfo
+cmd/ctf-agent/web_dist/
+
+# OS/editor
+.DS_Store
+.idea/
+.vscode/
+.cache/

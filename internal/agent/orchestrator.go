@@ -12,14 +12,6 @@ import (
 	"github.com/Conly-Zy/CTF-Agent/internal/tools"
 )
 
-type Logger interface {
-	Log(level, message string)
-	ToolStart(tool string)
-	ToolResult(tool, result string)
-	Thinking(content string)
-	Flag(flag string)
-}
-
 // SessionControls provides external control signals for a solving session.
 type SessionControls struct {
 	PauseCh   <-chan struct{} // receive when pause is requested
@@ -36,21 +28,6 @@ type Orchestrator struct {
 	maxIter        int
 	timeout        time.Duration
 	flagPatterns   []*regexp.Regexp
-}
-
-type Store interface {
-	AddConversationMessage(msg any) error
-}
-
-// KnowledgeStore provides access to historical knowledge for prompt injection.
-type KnowledgeStore interface {
-	SearchKnowledgeByType(challengeType string, limit int) ([]KnowledgeEntry, error)
-}
-
-type KnowledgeEntry struct {
-	Title   string
-	Content string
-	Type    string
 }
 
 type SolveRequest struct {
@@ -441,15 +418,6 @@ func (o *Orchestrator) extractFlag(text string) string {
 	}
 
 	return ""
-}
-
-func indexOf(s, substr string) int {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return i
-		}
-	}
-	return -1
 }
 
 // buildPayload is kept for backward compatibility

@@ -1,0 +1,26 @@
+{
+  "tools": [
+    {
+      "name": "nmap_scan",
+      "description": "使用 nmap 进行端口扫描",
+      "version": "1.0.0",
+      "executable": "nmap_tool.sh",
+      "group": "pwn",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "target": {
+            "type": "string",
+            "description": "扫描目标"
+          },
+          "ports": {
+            "type": "string",
+            "description": "端口范围",
+            "default": "1-1000"
+          }
+        },
+        "required": ["target"]
+      }
+    }
+  ]
+}

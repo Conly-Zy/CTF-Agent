@@ -7,6 +7,7 @@ import (
 	"os"
 
 	"github.com/Conly-Zy/CTF-Agent/internal/agent"
+	"github.com/Conly-Zy/CTF-Agent/internal/agent/specialists"
 	"github.com/Conly-Zy/CTF-Agent/internal/api"
 	"github.com/Conly-Zy/CTF-Agent/internal/config"
 	"github.com/Conly-Zy/CTF-Agent/internal/llm"
@@ -32,11 +33,18 @@ var (
 )
 
 func init() {
-	serverCmd.Flags().StringVar(&serverAddr, "addr", ":4399", "服务器监听地址")
-	serverCmd.Flags().StringVarP(&serverConfig, "config", "c", "config.yaml", "配置文件路径")
-	serverCmd.Flags().StringVar(&dbPath, "db", "ctf-agent.db", "数据库路径")
+	serverCmd.Flags().StringVar(&serverAddr, "addr", envOrDefault("CTF_AGENT_ADDR", ":4399"), "服务器监听地址")
+	serverCmd.Flags().StringVarP(&serverConfig, "config", "c", envOrDefault("CTF_AGENT_CONFIG", "config.yaml"), "配置文件路径")
+	serverCmd.Flags().StringVar(&dbPath, "db", envOrDefault("CTF_AGENT_DB", "ctf-agent.db"), "数据库路径")
 
 	rootCmd.AddCommand(serverCmd)
+}
+
+func envOrDefault(key, fallback string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return fallback
 }
 
 func runServer(cmd *cobra.Command, args []string) error {
@@ -63,24 +71,44 @@ func runServer(cmd *cobra.Command, args []string) error {
 	registerCryptoTools(registry)
 	registerReverseTools(registry)
 
-	// Initialize LLM client
-	llmClient, err := llm.NewClient(cfg.Anthropic.APIKey, cfg.Anthropic.Model)
+	// Initialize LLM client with multi-provider support
+	llmProvider, err := llm.NewProvider(llm.ProviderConfig{
+		Type:    llm.ProviderType(cfg.GetProvider()),
+		APIKey:  cfg.GetAPIKey(),
+		Model:   cfg.GetModel(),
+		BaseURL: cfg.LLM.BaseURL,
+	})
 	if err != nil {
-		logger.Warn("LLM client not configured", "error", err)
+		logger.Warn("LLM provider not configured", "error", err)
+	}
+	var llmClient *llm.Client
+	if llmProvider != nil {
+		llmClient = llm.NewClientWithProvider(llmProvider)
 	}
 
-	// Initialize orchestrator
+	// Initialize orchestrator and primary agent
 	var orch *agent.Orchestrator
+	var primaryAgent *agent.PrimaryAgent
 	if llmClient != nil {
 		orch = agent.NewOrchestrator(llmClient, registry, logger, cfg.Agent.MaxIterations, cfg.Agent.Timeout)
 		orch.SetFlagPatterns(cfg.Flag.Patterns)
 		orch.SetKnowledgeStore(&knowledgeAdapter{store: db})
+
+		// Create PrimaryAgent with specialist agents
+		primaryAgent = agent.NewPrimaryAgent(llmClient, registry, logger, cfg.Agent.MaxIterations, cfg.Agent.Timeout)
+		primaryAgent.RegisterAgent(specialists.NewWebAgent(llmClient, registry, logger, cfg.Agent.MaxIterations, cfg.Agent.Timeout))
+		primaryAgent.RegisterAgent(specialists.NewPwnAgent(llmClient, registry, logger, cfg.Agent.MaxIterations, cfg.Agent.Timeout))
+		primaryAgent.RegisterAgent(specialists.NewCryptoAgent(llmClient, registry, logger, cfg.Agent.MaxIterations, cfg.Agent.Timeout))
+		primaryAgent.RegisterAgent(specialists.NewReverseAgent(llmClient, registry, logger, cfg.Agent.MaxIterations, cfg.Agent.Timeout))
 	}
 
 	// Create server
 	server := api.NewServer(db, logger, serverAddr)
 	if orch != nil {
 		server.SetOrchestrator(orch)
+	}
+	if primaryAgent != nil {
+		server.SetPrimaryAgent(primaryAgent)
 	}
 	server.SetRegistry(registry)
 	server.SetConfig(cfg)
@@ -96,8 +124,8 @@ func runServer(cmd *cobra.Command, args []string) error {
 	fmt.Printf("Starting CTF-Agent web server...\n")
 	fmt.Printf("Address: %s\n", serverAddr)
 	fmt.Printf("Database: %s\n", dbPath)
-	if cfg.Anthropic.APIKey == "" {
-		fmt.Printf("WARNING: ANTHROPIC_API_KEY not set - solving will not work\n")
+	if cfg.GetAPIKey() == "" {
+		fmt.Printf("WARNING: LLM API key not set - solving will not work\n")
 	}
 
 	return server.Start()

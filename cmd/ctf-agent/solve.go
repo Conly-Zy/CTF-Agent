@@ -7,6 +7,7 @@ import (
 	"os"
 
 	"github.com/Conly-Zy/CTF-Agent/internal/agent"
+	"github.com/Conly-Zy/CTF-Agent/internal/agent/specialists"
 	"github.com/Conly-Zy/CTF-Agent/internal/config"
 	"github.com/Conly-Zy/CTF-Agent/internal/llm"
 	"github.com/Conly-Zy/CTF-Agent/internal/tools"
@@ -52,10 +53,17 @@ func runSolve(cmd *cobra.Command, args []string) error {
 		Level: slog.LevelInfo,
 	}))
 
-	llmClient, err := llm.NewClient(cfg.Anthropic.APIKey, cfg.Anthropic.Model)
+	// 创建 LLM Provider
+	llmProvider, err := llm.NewProvider(llm.ProviderConfig{
+		Type:    llm.ProviderType(cfg.GetProvider()),
+		APIKey:  cfg.GetAPIKey(),
+		Model:   cfg.GetModel(),
+		BaseURL: cfg.LLM.BaseURL,
+	})
 	if err != nil {
-		return fmt.Errorf("create LLM client: %w", err)
+		return fmt.Errorf("create LLM provider: %w", err)
 	}
+	llmClient := llm.NewClientWithProvider(llmProvider)
 
 	registry := tools.NewRegistry()
 	registerCommonTools(registry)
@@ -64,8 +72,14 @@ func runSolve(cmd *cobra.Command, args []string) error {
 	registerCryptoTools(registry)
 	registerReverseTools(registry)
 
-	orchestrator := agent.NewOrchestrator(llmClient, registry, logger, cfg.Agent.MaxIterations, cfg.Agent.Timeout)
-	orchestrator.SetFlagPatterns(cfg.Flag.Patterns)
+	// 创建 PrimaryAgent
+	primaryAgent := agent.NewPrimaryAgent(llmClient, registry, logger, cfg.Agent.MaxIterations, cfg.Agent.Timeout)
+
+	// 注册专业 Agent
+	primaryAgent.RegisterAgent(specialists.NewWebAgent(llmClient, registry, logger, cfg.Agent.MaxIterations, cfg.Agent.Timeout))
+	primaryAgent.RegisterAgent(specialists.NewPwnAgent(llmClient, registry, logger, cfg.Agent.MaxIterations, cfg.Agent.Timeout))
+	primaryAgent.RegisterAgent(specialists.NewCryptoAgent(llmClient, registry, logger, cfg.Agent.MaxIterations, cfg.Agent.Timeout))
+	primaryAgent.RegisterAgent(specialists.NewReverseAgent(llmClient, registry, logger, cfg.Agent.MaxIterations, cfg.Agent.Timeout))
 
 	req := agent.SolveRequest{
 		ChallengeType: challengeType,
@@ -79,7 +93,8 @@ func runSolve(cmd *cobra.Command, args []string) error {
 	fmt.Printf("Target: %s\n\n", req.Target)
 
 	ctx := context.Background()
-	result, err := orchestrator.Solve(ctx, req)
+	task := agent.SolveRequestToTask(req)
+	result, err := primaryAgent.Run(ctx, task)
 	if err != nil {
 		return fmt.Errorf("solve failed: %w", err)
 	}
@@ -93,7 +108,7 @@ func runSolve(cmd *cobra.Command, args []string) error {
 	fmt.Printf("Duration: %v\n", result.Duration)
 
 	if !result.Success {
-		return fmt.Errorf("failed to find flag: %w", result.Error)
+		return fmt.Errorf("failed to find flag: %s", result.Error)
 	}
 
 	return nil

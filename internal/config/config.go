@@ -9,17 +9,35 @@ import (
 )
 
 type Config struct {
+	LLM       LLMConfig       `yaml:"llm" json:"llm"`
 	Anthropic AnthropicConfig `yaml:"anthropic" json:"anthropic"`
 	Agent     AgentConfig     `yaml:"agent" json:"agent"`
 	Sandbox   SandboxConfig   `yaml:"sandbox" json:"sandbox"`
 	Flag      FlagConfig      `yaml:"flag" json:"flag"`
 	Submit    SubmitConfig    `yaml:"submit" json:"submit"`
+	Auth      AuthConfig      `yaml:"auth" json:"auth"`
 	path      string          `yaml:"-" json:"-"`
+}
+
+// LLMConfig 多提供者配置
+type LLMConfig struct {
+	Provider string `yaml:"provider" json:"provider"` // anthropic, openai
+	APIKey   string `yaml:"api_key" json:"api_key"`
+	Model    string `yaml:"model" json:"model"`
+	BaseURL  string `yaml:"base_url" json:"base_url,omitempty"`
 }
 
 type AnthropicConfig struct {
 	APIKey string `yaml:"api_key" json:"api_key"`
 	Model  string `yaml:"model" json:"model"`
+}
+
+// AuthConfig 认证配置
+type AuthConfig struct {
+	Enabled   bool   `yaml:"enabled" json:"enabled"`
+	APIKey    string `yaml:"api_key,omitempty" json:"api_key,omitempty"`
+	RateLimit int    `yaml:"rate_limit" json:"rate_limit"` // 每秒请求数
+	RateBurst int    `yaml:"rate_burst" json:"rate_burst"` // 突发容量
 }
 
 type AgentConfig struct {
@@ -50,6 +68,10 @@ type SubmitConfig struct {
 
 func DefaultConfig() *Config {
 	return &Config{
+		LLM: LLMConfig{
+			Provider: "anthropic",
+			Model:    "claude-opus-4-7",
+		},
 		Anthropic: AnthropicConfig{
 			Model: "claude-opus-4-7",
 		},
@@ -76,6 +98,11 @@ func DefaultConfig() *Config {
 			Method: "POST",
 			Field:  "flag",
 		},
+		Auth: AuthConfig{
+			Enabled:   false,
+			RateLimit: 10,
+			RateBurst: 20,
+		},
 	}
 }
 
@@ -94,12 +121,51 @@ func Load(path string) (*Config, error) {
 		}
 	}
 
-	if envKey := os.Getenv("ANTHROPIC_API_KEY"); envKey != "" {
-		cfg.Anthropic.APIKey = envKey
-	}
-
+	cfg.normalizePlaceholders()
+	cfg.applyEnvOverrides()
 	cfg.SyncTimeoutSec()
 	return cfg, nil
+}
+
+func (c *Config) normalizePlaceholders() {
+	if isEnvPlaceholder(c.LLM.APIKey) {
+		c.LLM.APIKey = ""
+	}
+	if isEnvPlaceholder(c.Anthropic.APIKey) {
+		c.Anthropic.APIKey = ""
+	}
+}
+
+func isEnvPlaceholder(value string) bool {
+	return len(value) > 3 && value[:2] == "${" && value[len(value)-1:] == "}"
+}
+
+func (c *Config) applyEnvOverrides() {
+	if provider := os.Getenv("LLM_PROVIDER"); provider != "" {
+		c.LLM.Provider = provider
+	}
+	if model := os.Getenv("LLM_MODEL"); model != "" {
+		c.LLM.Model = model
+		if c.GetProvider() == "anthropic" {
+			c.Anthropic.Model = model
+		}
+	}
+	if baseURL := os.Getenv("LLM_BASE_URL"); baseURL != "" {
+		c.LLM.BaseURL = baseURL
+	}
+
+	if envKey := os.Getenv("ANTHROPIC_API_KEY"); envKey != "" {
+		c.Anthropic.APIKey = envKey
+		if c.GetProvider() == "anthropic" {
+			c.LLM.APIKey = envKey
+		}
+	}
+	if envKey := os.Getenv("OPENAI_API_KEY"); envKey != "" && c.GetProvider() == "openai" {
+		c.LLM.APIKey = envKey
+	}
+	if envKey := os.Getenv("LLM_API_KEY"); envKey != "" {
+		c.LLM.APIKey = envKey
+	}
 }
 
 func (c *Config) SyncTimeoutSec() {
@@ -129,8 +195,35 @@ func (c *Config) Save() error {
 }
 
 func (c *Config) Validate() error {
-	if c.Anthropic.APIKey == "" {
-		return fmt.Errorf("anthropic API key is required")
+	if c.GetAPIKey() == "" {
+		return fmt.Errorf("API key is required")
 	}
 	return nil
+}
+
+// GetAPIKey 获取有效的 API Key（优先 LLM 配置，回退到 Anthropic 配置）
+func (c *Config) GetAPIKey() string {
+	if c.LLM.APIKey != "" {
+		return c.LLM.APIKey
+	}
+	return c.Anthropic.APIKey
+}
+
+// GetModel 获取有效的模型名称
+func (c *Config) GetModel() string {
+	if c.LLM.Model != "" {
+		return c.LLM.Model
+	}
+	if c.Anthropic.Model != "" {
+		return c.Anthropic.Model
+	}
+	return "claude-opus-4-7"
+}
+
+// GetProvider 获取 LLM 提供者类型
+func (c *Config) GetProvider() string {
+	if c.LLM.Provider != "" {
+		return c.LLM.Provider
+	}
+	return "anthropic"
 }

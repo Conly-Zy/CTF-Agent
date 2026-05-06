@@ -35,30 +35,30 @@ func (a *knowledgeAdapter) SearchKnowledgeByType(challengeType string, limit int
 }
 
 func registerCommonTools(r *tools.Registry) {
-	r.Register(common.NewFileReadTool())
-	r.Register(common.NewFileWriteTool())
-	r.Register(common.NewShellExecTool(30 * time.Second))
+	r.RegisterWithGroup(common.NewFileReadTool(), tools.GroupCommon)
+	r.RegisterWithGroup(common.NewFileWriteTool(), tools.GroupCommon)
+	r.RegisterWithGroup(common.NewShellExecTool(30*time.Second), tools.GroupCommon)
 }
 
 func registerWebTools(r *tools.Registry) {
-	r.Register(web.NewHTTPRequestTool(30 * time.Second))
-	r.Register(web.NewDirScanTool(60 * time.Second))
+	r.RegisterWithGroup(web.NewHTTPRequestTool(30*time.Second), tools.GroupWeb)
+	r.RegisterWithGroup(web.NewDirScanTool(60*time.Second), tools.GroupWeb)
 }
 
 func registerPwnTools(r *tools.Registry) {
-	r.Register(pwn.NewBinaryInfoTool(10 * time.Second))
-	r.Register(pwn.NewDisassembleTool(15 * time.Second))
-	r.Register(pwn.NewPatternTool())
+	r.RegisterWithGroup(pwn.NewBinaryInfoTool(10*time.Second), tools.GroupPwn)
+	r.RegisterWithGroup(pwn.NewDisassembleTool(15*time.Second), tools.GroupPwn)
+	r.RegisterWithGroup(pwn.NewPatternTool(), tools.GroupPwn)
 }
 
 func registerCryptoTools(r *tools.Registry) {
-	r.Register(crypto.NewEncodeDecodeTool())
-	r.Register(crypto.NewHashIDTool())
-	r.Register(crypto.NewMathTool())
+	r.RegisterWithGroup(crypto.NewEncodeDecodeTool(), tools.GroupCrypto)
+	r.RegisterWithGroup(crypto.NewHashIDTool(), tools.GroupCrypto)
+	r.RegisterWithGroup(crypto.NewMathTool(), tools.GroupCrypto)
 }
 
 func registerReverseTools(r *tools.Registry) {
-	r.Register(reverse.NewStringsTool(15 * time.Second))
-	r.Register(reverse.NewHexDumpTool())
-	r.Register(reverse.NewEntropyTool())
+	r.RegisterWithGroup(reverse.NewStringsTool(15*time.Second), tools.GroupReverse)
+	r.RegisterWithGroup(reverse.NewHexDumpTool(), tools.GroupReverse)
+	r.RegisterWithGroup(reverse.NewEntropyTool(), tools.GroupReverse)
 }

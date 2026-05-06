@@ -40,3 +40,10 @@ cmd/ctf-agent/web_dist/
 
 # Database
 *.db
+# Docker/local runtime
+.env
+data/
+uploads/
+logs/
+backups/
+.cache/

@@ -13,11 +13,22 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/Conly-Zy/CTF-Agent/internal/agent"
+	"github.com/Conly-Zy/CTF-Agent/internal/alerting"
+	"github.com/Conly-Zy/CTF-Agent/internal/auth"
+	"github.com/Conly-Zy/CTF-Agent/internal/cache"
 	"github.com/Conly-Zy/CTF-Agent/internal/config"
+	"github.com/Conly-Zy/CTF-Agent/internal/health"
 	"github.com/Conly-Zy/CTF-Agent/internal/knowledge"
+	"github.com/Conly-Zy/CTF-Agent/internal/logging"
+	"github.com/Conly-Zy/CTF-Agent/internal/metrics"
+	"github.com/Conly-Zy/CTF-Agent/internal/plugin"
+	"github.com/Conly-Zy/CTF-Agent/internal/report"
+	"github.com/Conly-Zy/CTF-Agent/internal/replay"
 	"github.com/Conly-Zy/CTF-Agent/internal/store"
+	"github.com/Conly-Zy/CTF-Agent/internal/taskqueue"
 	"github.com/Conly-Zy/CTF-Agent/internal/tools"
 	"github.com/gorilla/websocket"
 )
@@ -28,6 +39,7 @@ type Server struct {
 	mux          *http.ServeMux
 	addr         string
 	orchestrator *agent.Orchestrator
+	primaryAgent *agent.PrimaryAgent
 	extractor    *knowledge.Extractor
 	registry     *tools.Registry
 	cfg          *config.Config
@@ -39,6 +51,21 @@ type Server struct {
 
 	// Session management
 	activeSessions *SessionManager
+
+	// Metrics
+	metricsCollector *metrics.MetricsCollector
+
+	// Infrastructure
+	authenticator  *auth.Authenticator
+	rateLimiter    *auth.RateLimiter
+	cache          *cache.MemoryCache
+	healthChecker  *health.HealthChecker
+	alertManager   *alerting.AlertManager
+	logAggregator  *logging.LogAggregator
+
+	// New features
+	taskQueue      *taskqueue.TaskQueue
+	pluginLoader   *plugin.PluginLoader
 
 	// WebSocket clients
 	wsClients map[*websocket.Conn]bool
@@ -54,30 +81,65 @@ func NewServer(store *store.SQLiteStore, logger *slog.Logger, addr string) *Serv
 	os.MkdirAll(uploadDir, 0755)
 
 	s := &Server{
-		store:          store,
-		logger:         logger,
-		mux:            http.NewServeMux(),
-		addr:           addr,
-		extractor:      knowledge.NewExtractor(store),
-		activeSessions: NewSessionManager(),
-		wsClients:      make(map[*websocket.Conn]bool),
-		uploadDir:      uploadDir,
+		store:            store,
+		logger:           logger,
+		mux:              http.NewServeMux(),
+		addr:             addr,
+		extractor:        knowledge.NewExtractor(store),
+		activeSessions:   NewSessionManager(),
+		metricsCollector: metrics.NewMetricsCollector(),
+		wsClients:        make(map[*websocket.Conn]bool),
+		uploadDir:        uploadDir,
 	}
 
+	s.initInfrastructure()
 	s.routes()
 	return s
+}
+
+func (s *Server) initInfrastructure() {
+	s.authenticator = auth.NewAuthenticator("", false)
+	s.rateLimiter = auth.NewRateLimiter(10, 20)
+	s.cache = cache.NewMemoryCache(1000, 30*time.Minute)
+	s.healthChecker = health.NewHealthChecker(s.logger, 5*time.Second)
+	s.alertManager = alerting.NewAlertManager(s.logger)
+	s.logAggregator = logging.NewLogAggregator(s.logger, 10000, "/tmp/ctf-agent-logs.json")
+	s.taskQueue = taskqueue.NewTaskQueue("/tmp/ctf-agent-tasks.json", s.logger)
+	s.pluginLoader = plugin.NewPluginLoader(nil, "/tmp/ctf-agent-plugins", s.logger)
+
+	// Register default health checks
+	for name, check := range health.DefaultChecks() {
+		s.healthChecker.Register(name, check)
+	}
+
+	// Start alert manager
+	s.alertManager.Start()
+	s.logAggregator.Start()
 }
 
 func (s *Server) SetOrchestrator(o *agent.Orchestrator) {
 	s.orchestrator = o
 }
 
+func (s *Server) SetPrimaryAgent(pa *agent.PrimaryAgent) {
+	s.primaryAgent = pa
+}
+
 func (s *Server) SetRegistry(r *tools.Registry) {
 	s.registry = r
+	if s.pluginLoader != nil {
+		s.pluginLoader.SetRegistry(r)
+	}
 }
 
 func (s *Server) SetConfig(cfg *config.Config) {
 	s.cfg = cfg
+	if cfg != nil && cfg.Auth.Enabled {
+		s.authenticator = auth.NewAuthenticator(cfg.Auth.APIKey, true)
+		if cfg.Auth.RateLimit > 0 {
+			s.rateLimiter = auth.NewRateLimiter(cfg.Auth.RateLimit, cfg.Auth.RateBurst)
+		}
+	}
 }
 
 func (s *Server) SetFrontendFS(fsys fs.FS) {
@@ -110,6 +172,51 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/config", s.handleGetConfig)
 	s.mux.HandleFunc("PUT /api/config", s.handleUpdateConfig)
 
+	// Metrics and Health
+	s.mux.HandleFunc("GET /api/metrics", s.handleMetrics)
+	s.mux.HandleFunc("GET /api/metrics/agents", s.handleAgentMetrics)
+	s.mux.HandleFunc("GET /api/metrics/tools", s.handleToolMetrics)
+	s.mux.HandleFunc("GET /api/metrics/llm", s.handleLLMMetrics)
+	s.mux.HandleFunc("GET /api/metrics/system", s.handleSystemMetrics)
+	s.mux.HandleFunc("GET /api/health", s.handleHealth)
+	s.mux.HandleFunc("GET /api/health/ready", s.handleReadiness)
+	s.mux.HandleFunc("GET /api/health/live", s.handleLiveness)
+
+	// Auth management
+	s.mux.HandleFunc("POST /api/auth/keys", s.handleCreateAPIKey)
+	s.mux.HandleFunc("GET /api/auth/keys", s.handleListAPIKeys)
+	s.mux.HandleFunc("DELETE /api/auth/keys/{key}", s.handleDeleteAPIKey)
+
+	// Cache management
+	s.mux.HandleFunc("GET /api/cache/stats", s.handleCacheStats)
+	s.mux.HandleFunc("DELETE /api/cache", s.handleCacheClear)
+
+	// Alerting
+	s.mux.HandleFunc("GET /api/alerts", s.handleListAlerts)
+	s.mux.HandleFunc("GET /api/alerts/active", s.handleActiveAlerts)
+	s.mux.HandleFunc("POST /api/alerts/{id}/resolve", s.handleResolveAlert)
+	s.mux.HandleFunc("GET /api/alerts/stats", s.handleAlertStats)
+
+	// Logs
+	s.mux.HandleFunc("GET /api/logs", s.handleListLogs)
+	s.mux.HandleFunc("GET /api/logs/search", s.handleSearchLogs)
+
+	// Task Queue
+	s.mux.HandleFunc("GET /api/tasks", s.handleListTasks)
+	s.mux.HandleFunc("POST /api/tasks", s.handleEnqueueTask)
+	s.mux.HandleFunc("POST /api/tasks/{id}/cancel", s.handleCancelTask)
+	s.mux.HandleFunc("GET /api/tasks/stats", s.handleTaskStats)
+
+	// Session Replay
+	s.mux.HandleFunc("GET /api/sessions/{id}/replay", s.handleGetReplay)
+
+	// Report
+	s.mux.HandleFunc("GET /api/sessions/{id}/report", s.handleGetReport)
+
+	// Plugins
+	s.mux.HandleFunc("GET /api/plugins", s.handleListPlugins)
+	s.mux.HandleFunc("POST /api/plugins/reload", s.handleReloadPlugins)
+
 	// WebSocket
 	s.mux.HandleFunc("GET /ws", s.handleWebSocket)
 
@@ -132,10 +239,21 @@ func (s *Server) routes() {
 
 func (s *Server) Start() error {
 	s.logger.Info("starting HTTP server", "addr", s.addr)
+
+	var handler http.Handler
 	if s.spaFS != nil {
-		return http.ListenAndServe(s.addr, s.spaHandler())
+		handler = s.spaHandler()
+	} else {
+		handler = s.mux
 	}
-	return http.ListenAndServe(s.addr, s.mux)
+
+	// Apply middleware chain: CORS -> RateLimit -> Auth -> Handler
+	corsMiddleware := auth.CORSMiddleware([]string{"*"})
+	handler = corsMiddleware(handler)
+	handler = s.rateLimiter.RateLimitMiddleware(handler)
+	handler = s.authenticator.AuthMiddleware(handler)
+
+	return http.ListenAndServe(s.addr, handler)
 }
 
 // spaHandler serves the embedded SPA frontend. API/WS routes go to the mux,
@@ -257,14 +375,78 @@ func (s *Server) solveAsync(sess *store.Session, req struct {
 		"message": fmt.Sprintf("会话 #%d 开始解题", sess.ID),
 	})
 
-	if s.orchestrator == nil {
+	// 优先使用 PrimaryAgent，回退到 Orchestrator
+	if s.primaryAgent != nil {
+		s.solveWithPrimaryAgent(sess, req)
+	} else if s.orchestrator != nil {
+		s.solveWithOrchestrator(sess, req)
+	} else {
 		sess.Status = "failed"
-		sess.Error = "Orchestrator not configured"
+		sess.Error = "No agent configured"
 		s.store.UpdateSession(sess)
-		s.broadcast(map[string]any{"type": "complete", "success": false, "error": "Orchestrator not configured"})
+		s.broadcast(map[string]any{"type": "complete", "success": false, "error": "No agent configured"})
+	}
+}
+
+func (s *Server) solveWithPrimaryAgent(sess *store.Session, req struct {
+	ChallengeType string   `json:"challenge_type"`
+	Description   string   `json:"description"`
+	Target        string   `json:"target"`
+	Files         []string `json:"files"`
+}) {
+	// Create cancellable context and register with session manager
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	s.activeSessions.Register(sess.ID, cancel)
+	defer s.activeSessions.Remove(sess.ID)
+
+	// 创建任务
+	task := agent.Task{
+		ID:          fmt.Sprintf("session-%d", sess.ID),
+		Type:        req.ChallengeType,
+		Description: req.Description,
+		Target:      req.Target,
+		Files:       req.Files,
+	}
+
+	// 执行任务
+	result, err := s.primaryAgent.Run(ctx, task)
+
+	if err != nil {
+		sess.Status = "failed"
+		sess.Error = err.Error()
+		s.store.UpdateSession(sess)
+		s.broadcast(map[string]any{"type": "complete", "success": false, "error": err.Error()})
 		return
 	}
 
+	sess.Status = "success"
+	sess.Flag = result.Flag
+	sess.Iterations = result.Iterations
+	completedAt := time.Now()
+	sess.CompletedAt = &completedAt
+	s.store.UpdateSession(sess)
+
+	// Extract knowledge
+	messages, _ := s.store.GetConversationMessages(sess.ID)
+	s.extractor.ExtractFromSession(sess, messages)
+
+	s.broadcast(map[string]any{
+		"type":       "complete",
+		"success":    true,
+		"flag":       result.Flag,
+		"iterations": result.Iterations,
+		"duration":   result.Duration.String(),
+	})
+}
+
+func (s *Server) solveWithOrchestrator(sess *store.Session, req struct {
+	ChallengeType string   `json:"challenge_type"`
+	Description   string   `json:"description"`
+	Target        string   `json:"target"`
+	Files         []string `json:"files"`
+}) {
 	// Create cancellable context and register with session manager
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -798,4 +980,301 @@ func (l *wsLogger) Flag(flag string) {
 		"type": "flag",
 		"flag": flag,
 	})
+}
+
+func (l *wsLogger) AgentStart(agentName string) {
+	l.server.broadcast(map[string]any{
+		"type":       "agent_start",
+		"agent_name": agentName,
+	})
+}
+
+func (l *wsLogger) AgentComplete(agentName string, success bool) {
+	l.server.broadcast(map[string]any{
+		"type":       "agent_complete",
+		"agent_name": agentName,
+		"success":    success,
+	})
+}
+
+func (l *wsLogger) TaskAssigned(taskID, agentName string) {
+	l.server.broadcast(map[string]any{
+		"type":       "task_assigned",
+		"task_id":    taskID,
+		"agent_name": agentName,
+	})
+}
+
+// Metrics handlers
+func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	summary := s.metricsCollector.GetSummary()
+	s.writeJSON(w, summary)
+}
+
+func (s *Server) handleAgentMetrics(w http.ResponseWriter, r *http.Request) {
+	metrics := s.metricsCollector.GetAllAgentMetrics()
+	s.writeJSON(w, metrics)
+}
+
+func (s *Server) handleToolMetrics(w http.ResponseWriter, r *http.Request) {
+	metrics := s.metricsCollector.GetAllToolMetrics()
+	s.writeJSON(w, metrics)
+}
+
+func (s *Server) handleLLMMetrics(w http.ResponseWriter, r *http.Request) {
+	metrics := s.metricsCollector.GetLLMMetrics()
+	s.writeJSON(w, metrics)
+}
+
+func (s *Server) handleSystemMetrics(w http.ResponseWriter, r *http.Request) {
+	metrics := s.metricsCollector.GetSystemMetrics()
+	s.writeJSON(w, metrics)
+}
+
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	report := s.healthChecker.Check(r.Context())
+	s.writeJSON(w, map[string]any{
+		"status":    string(report.Status),
+		"checks":    report.Checks,
+		"timestamp": report.Timestamp.Unix(),
+		"duration":  report.Duration.String(),
+		"version":   "1.0.0",
+	})
+}
+
+func (s *Server) handleReadiness(w http.ResponseWriter, r *http.Request) {
+	// Readiness is based on store availability
+	ready := s.store != nil
+	if !ready {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		s.writeJSON(w, map[string]any{"ready": false})
+		return
+	}
+	s.writeJSON(w, map[string]any{"ready": true})
+}
+
+func (s *Server) handleLiveness(w http.ResponseWriter, r *http.Request) {
+	s.writeJSON(w, map[string]any{"alive": true, "timestamp": time.Now().Unix()})
+}
+
+// Auth handlers
+func (s *Server) handleCreateAPIKey(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Name   string `json:"name"`
+		UserID string `json:"user_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if req.Name == "" {
+		req.Name = "default"
+	}
+	if req.UserID == "" {
+		req.UserID = auth.GetUserID(r.Context())
+	}
+
+	key, err := s.authenticator.GenerateAPIKey(req.Name, req.UserID, 0)
+	if err != nil {
+		s.writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	s.writeJSON(w, key)
+}
+
+func (s *Server) handleListAPIKeys(w http.ResponseWriter, r *http.Request) {
+	userID := r.URL.Query().Get("user_id")
+	keys := s.authenticator.ListAPIKeys(userID)
+	s.writeJSON(w, keys)
+}
+
+func (s *Server) handleDeleteAPIKey(w http.ResponseWriter, r *http.Request) {
+	key := r.PathValue("key")
+	if err := s.authenticator.DeleteAPIKey(key); err != nil {
+		s.writeError(w, http.StatusNotFound, err)
+		return
+	}
+	s.writeJSON(w, map[string]any{"ok": true})
+}
+
+// Cache handlers
+func (s *Server) handleCacheStats(w http.ResponseWriter, r *http.Request) {
+	s.writeJSON(w, s.cache.Stats())
+}
+
+func (s *Server) handleCacheClear(w http.ResponseWriter, r *http.Request) {
+	s.cache.Clear()
+	s.writeJSON(w, map[string]any{"ok": true})
+}
+
+// Alert handlers
+func (s *Server) handleListAlerts(w http.ResponseWriter, r *http.Request) {
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	if limit <= 0 {
+		limit = 50
+	}
+	alerts := s.alertManager.GetAllAlerts(limit)
+	s.writeJSON(w, alerts)
+}
+
+func (s *Server) handleActiveAlerts(w http.ResponseWriter, r *http.Request) {
+	alerts := s.alertManager.GetActiveAlerts()
+	s.writeJSON(w, alerts)
+}
+
+func (s *Server) handleResolveAlert(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if err := s.alertManager.Resolve(id); err != nil {
+		s.writeError(w, http.StatusNotFound, err)
+		return
+	}
+	s.writeJSON(w, map[string]any{"ok": true})
+}
+
+func (s *Server) handleAlertStats(w http.ResponseWriter, r *http.Request) {
+	s.writeJSON(w, s.alertManager.GetStats())
+}
+
+// Log handlers
+func (s *Server) handleListLogs(w http.ResponseWriter, r *http.Request) {
+	level := r.URL.Query().Get("level")
+	sessionID := r.URL.Query().Get("session_id")
+	agentName := r.URL.Query().Get("agent")
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	if limit <= 0 {
+		limit = 100
+	}
+
+	filter := logging.LogFilter{
+		Level:     level,
+		SessionID: sessionID,
+		Agent:     agentName,
+		Limit:     limit,
+	}
+	logs := s.logAggregator.Query(filter)
+	s.writeJSON(w, logs)
+}
+
+func (s *Server) handleSearchLogs(w http.ResponseWriter, r *http.Request) {
+	keyword := r.URL.Query().Get("q")
+	if keyword == "" {
+		s.writeError(w, http.StatusBadRequest, fmt.Errorf("search query required"))
+		return
+	}
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	if limit <= 0 {
+		limit = 50
+	}
+
+	logs := s.logAggregator.Search(keyword, limit)
+	s.writeJSON(w, logs)
+}
+
+// Task Queue handlers
+func (s *Server) handleListTasks(w http.ResponseWriter, r *http.Request) {
+	status := taskqueue.TaskStatus(r.URL.Query().Get("status"))
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	if limit <= 0 {
+		limit = 50
+	}
+	tasks := s.taskQueue.List(status, limit)
+	s.writeJSON(w, tasks)
+}
+
+func (s *Server) handleEnqueueTask(w http.ResponseWriter, r *http.Request) {
+	var task taskqueue.QueuedTask
+	if err := json.NewDecoder(r.Body).Decode(&task); err != nil {
+		s.writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if task.MaxRetries == 0 {
+		task.MaxRetries = 3
+	}
+	if err := s.taskQueue.Enqueue(&task); err != nil {
+		s.writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	s.writeJSON(w, task)
+}
+
+func (s *Server) handleCancelTask(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if err := s.taskQueue.Cancel(id); err != nil {
+		s.writeError(w, http.StatusNotFound, err)
+		return
+	}
+	s.writeJSON(w, map[string]any{"ok": true})
+}
+
+func (s *Server) handleTaskStats(w http.ResponseWriter, r *http.Request) {
+	s.writeJSON(w, s.taskQueue.Stats())
+}
+
+// Session Replay handler
+func (s *Server) handleGetReplay(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		s.writeError(w, http.StatusBadRequest, fmt.Errorf("invalid id"))
+		return
+	}
+
+	replayPath := filepath.Join("/tmp/ctf-agent-replays", fmt.Sprintf("session-%d.json", id))
+	rp, err := replay.LoadReplay(replayPath)
+	if err != nil {
+		s.writeError(w, http.StatusNotFound, fmt.Errorf("replay not found for session %d", id))
+		return
+	}
+
+	s.writeJSON(w, rp)
+}
+
+// Report handler
+func (s *Server) handleGetReport(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		s.writeError(w, http.StatusBadRequest, fmt.Errorf("invalid id"))
+		return
+	}
+
+	session, err := s.store.GetSession(id)
+	if err != nil {
+		s.writeError(w, http.StatusNotFound, fmt.Errorf("session not found"))
+		return
+	}
+
+	gen := report.NewReportGenerator()
+
+	// Try to load replay for richer report
+	replayPath := filepath.Join("/tmp/ctf-agent-replays", fmt.Sprintf("session-%d.json", id))
+	rp, err := replay.LoadReplay(replayPath)
+
+	var rpt *report.Report
+	if err == nil {
+		rpt = gen.GenerateFromReplay(session, rp)
+	} else {
+		rpt = gen.GenerateFromSession(session)
+	}
+
+	format := r.URL.Query().Get("format")
+	if format == "markdown" {
+		w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
+		w.Write([]byte(gen.RenderMarkdown(rpt)))
+		return
+	}
+
+	s.writeJSON(w, rpt)
+}
+
+// Plugin handlers
+func (s *Server) handleListPlugins(w http.ResponseWriter, r *http.Request) {
+	plugins := s.pluginLoader.ListPlugins()
+	s.writeJSON(w, plugins)
+}
+
+func (s *Server) handleReloadPlugins(w http.ResponseWriter, r *http.Request) {
+	if err := s.pluginLoader.Reload(); err != nil {
+		s.writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	s.writeJSON(w, map[string]any{"ok": true, "count": len(s.pluginLoader.ListPlugins())})
 }

@@ -34,13 +34,13 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 24
           cache: npm
           cache-dependency-path: web/package-lock.json
 
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
+          go-version-file: go.mod
           cache: true
 
       - name: Build frontend
@@ -51,6 +51,7 @@ jobs:
         run: |
           rm -rf cmd/ctf-agent/web_dist
           cp -r web/dist cmd/ctf-agent/web_dist
+          mkdir -p dist
 
       - name: Build binary
         env:
@@ -59,7 +60,7 @@ jobs:
           CGO_ENABLED: 0
         run: |
           BINARY=ctf-agent-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.suffix }}
-          go build -ldflags="-s -w" -o "dist/${BINARY}" ./cmd/ctf-agent
+          go build -trimpath -ldflags="-s -w" -o "dist/${BINARY}" ./cmd/ctf-agent
           tar -czf "dist/ctf-agent-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz" -C dist "${BINARY}"
 
       - name: Upload to release

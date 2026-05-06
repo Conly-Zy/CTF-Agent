@@ -28,13 +28,13 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 24
           cache: npm
           cache-dependency-path: web/package-lock.json
 
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
+          go-version-file: go.mod
           cache: true
 
       - name: Build frontend
@@ -45,13 +45,14 @@ jobs:
         run: |
           rm -rf cmd/ctf-agent/web_dist
           cp -r web/dist cmd/ctf-agent/web_dist
+          mkdir -p bin
 
       - name: Build binary
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: 0
-        run: go build -ldflags="-s -w" -o bin/ctf-agent-${{ matrix.goos }}-${{ matrix.goarch }} ./cmd/ctf-agent
+        run: go build -trimpath -ldflags="-s -w" -o bin/ctf-agent-${{ matrix.goos }}-${{ matrix.goarch }} ./cmd/ctf-agent
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
