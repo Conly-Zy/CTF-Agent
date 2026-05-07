@@ -39,6 +39,7 @@ export interface DashboardData {
     avg_duration_ms: number
   }
   sessions: Session[]
+  tool_call_stats?: ToolCallStats | null
 }
 
 export interface Session {
@@ -73,6 +74,124 @@ export interface KnowledgeItem {
   content: string
   type: string
   created_at: string
+}
+
+export interface Subtask {
+  id: number
+  session_id: number
+  task_id: string
+  parent_id: string
+  agent_name: string
+  agent_type: string
+  challenge_type: string
+  title: string
+  description: string
+  target: string
+  status: string
+  result: string
+  error: string
+  sort_order: number
+  created_at: string
+  updated_at: string
+  completed_at: string | null
+}
+
+export interface ToolCall {
+  id: number
+  session_id: number
+  subtask_id?: number
+  task_id: string
+  agent_name: string
+  agent_type: string
+  tool_use_id: string
+  tool_name: string
+  input: string
+  output: string
+  status: string
+  error: string
+  started_at: string
+  completed_at: string | null
+  duration_ms: number
+}
+
+export interface ToolCallGroupStat {
+  name: string
+  total_calls: number
+  success_calls: number
+  failed_calls: number
+  total_duration_ms: number
+  avg_duration_ms: number
+  last_used: string
+}
+
+export interface ToolCallStats {
+  total_calls: number
+  success_calls: number
+  failed_calls: number
+  total_duration_ms: number
+  avg_duration_ms: number
+  by_tool: ToolCallGroupStat[]
+  by_agent: ToolCallGroupStat[]
+}
+
+export interface FlowTemplate {
+  id: number
+  challenge_type: string
+  title: string
+  description: string
+  content: string
+  tags: string
+  created_at: string
+  updated_at: string
+}
+
+export type PlanOperationType = 'add' | 'remove' | 'modify' | 'reorder'
+
+export interface PlanOperation {
+  op: PlanOperationType
+  id?: number
+  after_id?: number
+  title?: string
+  description?: string
+}
+
+export interface PlanPatch {
+  message?: string
+  operations: PlanOperation[]
+}
+
+export interface PlanSuggestion {
+  patch: PlanPatch
+  source: string
+  error?: string
+}
+
+export interface PlanSuggestResult {
+  suggestion: PlanSuggestion
+  applied: boolean
+  plan?: Subtask[]
+}
+
+export interface GeneratePlanResult {
+  created: number
+  source: string
+  plan: Subtask[]
+}
+
+export interface SolveRequest {
+  challenge_type: string
+  description: string
+  target: string
+  files: string[]
+  plan_with_llm?: boolean
+  template_id?: number
+}
+
+export interface SolveResponse {
+  session_id: number
+  status: string
+  planned_subtasks?: number
+  plan_source?: string
 }
 
 export interface Tag {
@@ -112,11 +231,64 @@ export const api = {
     document.body.removeChild(a)
   },
 
-  solve: (data: { challenge_type: string; description: string; target: string; files: string[] }) =>
-    request<{ session_id: number; status: string }>('/api/solve', {
+  solve: (data: SolveRequest) =>
+    request<SolveResponse>('/api/solve', {
       method: 'POST',
       body: JSON.stringify(data),
     }),
+
+  getSessionPlan: (id: number, status?: string) => {
+    const params = new URLSearchParams()
+    if (status) params.set('status', status)
+    const suffix = params.toString() ? `?${params}` : ''
+    return request<Subtask[]>(`/api/sessions/${id}/plan${suffix}`)
+  },
+
+  generatePlan: (id: number, opts?: { llm?: boolean; replace?: boolean; template_id?: number }) => {
+    const params = new URLSearchParams()
+    if (opts?.llm) params.set('llm', 'true')
+    if (opts?.replace) params.set('replace', 'true')
+    if (opts?.template_id) params.set('template_id', String(opts.template_id))
+    const suffix = params.toString() ? `?${params}` : ''
+    return request<GeneratePlanResult>(`/api/sessions/${id}/plan/generate${suffix}`, {
+      method: 'POST',
+      body: JSON.stringify({}),
+    })
+  },
+
+  patchPlan: (id: number, patch: PlanPatch) =>
+    request<Subtask[]>(`/api/sessions/${id}/plan/patch`, {
+      method: 'POST',
+      body: JSON.stringify(patch),
+    }),
+
+  refinePlan: (id: number) =>
+    request<Subtask[]>(`/api/sessions/${id}/plan/refine`, { method: 'POST' }),
+
+  suggestPlanPatch: (id: number, opts?: { llm?: boolean; apply?: boolean }) => {
+    const params = new URLSearchParams()
+    if (opts?.llm) params.set('llm', 'true')
+    if (opts?.apply) params.set('apply', 'true')
+    const suffix = params.toString() ? `?${params}` : ''
+    return request<PlanSuggestResult>(`/api/sessions/${id}/plan/suggest-patch${suffix}`, {
+      method: 'POST',
+    })
+  },
+
+  getSessionSubtasks: (id: number, status?: string) => {
+    const params = new URLSearchParams()
+    if (status) params.set('status', status)
+    const suffix = params.toString() ? `?${params}` : ''
+    return request<Subtask[]>(`/api/sessions/${id}/subtasks${suffix}`)
+  },
+
+  getSessionToolCalls: (id: number, limit = 200) =>
+    request<ToolCall[]>(`/api/sessions/${id}/tool-calls?limit=${limit}`),
+
+  getSessionToolCallStats: (id: number) =>
+    request<ToolCallStats>(`/api/sessions/${id}/tool-calls/stats`),
+
+  getToolCallStats: () => request<ToolCallStats>('/api/tool-calls/stats'),
 
   stopSession: (id: number) =>
     request<{ ok: boolean }>(`/api/sessions/${id}/stop`, { method: 'POST' }),
@@ -178,4 +350,28 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ input }),
     }),
+
+  getTemplates: (type?: string) => {
+    const params = new URLSearchParams()
+    if (type) params.set('type', type)
+    const suffix = params.toString() ? `?${params}` : ''
+    return request<FlowTemplate[]>(`/api/templates${suffix}`)
+  },
+
+  getTemplate: (id: number) => request<FlowTemplate>(`/api/templates/${id}`),
+
+  createTemplate: (data: Omit<FlowTemplate, 'id' | 'created_at' | 'updated_at'>) =>
+    request<FlowTemplate>('/api/templates', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+
+  updateTemplate: (id: number, data: Omit<FlowTemplate, 'id' | 'created_at' | 'updated_at'>) =>
+    request<FlowTemplate>(`/api/templates/${id}`, {
+      method: 'PUT',
+      body: JSON.stringify(data),
+    }),
+
+  deleteTemplate: (id: number) =>
+    request<{ ok: boolean }>(`/api/templates/${id}`, { method: 'DELETE' }),
 }

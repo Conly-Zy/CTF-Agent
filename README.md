@@ -14,6 +14,7 @@ CTF-Agent is an AI-assisted CTF solving platform with a CLI, web console, multi-
 - **LLM providers**: Anthropic Claude and OpenAI-compatible chat-completions endpoints.
 - **Web console**: Dashboard, sessions, live solving, tool testing, knowledge search, config editing, metrics, logs, alerts, replay, and reports.
 - **Knowledge base**: Automatically extracts reusable techniques, tags, commands, and snippets from solving sessions.
+- **Flow evidence model**: PentAGI-inspired session subtasks, tool-call traces, and reusable playbook templates for replayable CTF workflows.
 - **Sandbox support**: Docker-based execution helpers for safer challenge analysis.
 - **One-command startup**: Fresh machines can run the published GHCR image with `./scripts/bootstrap.sh`.
 - **CI/CD**: GitHub Actions build binaries, publish releases, and build multi-arch Docker images.
@@ -238,6 +239,7 @@ flowchart TD
     Tools --> Sandbox[Docker Sandbox]
     API --> Store[(SQLite Store)]
     Store --> Knowledge[Knowledge Base]
+    Store --> Evidence[Subtasks / Tool Calls / Templates]
     API --> Metrics[Metrics/Health/Logs/Alerts]
 ```
 
@@ -249,10 +251,20 @@ flowchart TD
 | `GET` | `/api/sessions` | List sessions |
 | `GET` | `/api/sessions/{id}` | Session details |
 | `GET` | `/api/sessions/{id}/messages` | Session conversation |
-| `POST` | `/api/solve` | Start solving task |
+| `GET` | `/api/sessions/{id}/plan` | Generated/refined solve plan |
+| `POST` | `/api/sessions/{id}/plan/generate` | Generate or regenerate session plan |
+| `POST` | `/api/sessions/{id}/plan/patch` | Patch solve plan add/remove/modify/reorder |
+| `POST` | `/api/sessions/{id}/plan/suggest-patch` | Suggest optional deterministic/LLM plan patch |
+| `POST` | `/api/sessions/{id}/plan/refine` | Refine persisted solve plan |
+| `GET` | `/api/sessions/{id}/subtasks` | Session agent subtasks |
+| `GET` | `/api/sessions/{id}/tool-calls` | Session tool-call trace |
+| `GET` | `/api/sessions/{id}/tool-calls/stats` | Session tool-call statistics |
+| `POST` | `/api/solve` | Start solving task; supports `plan_with_llm` and `template_id` |
 | `POST` | `/api/upload` | Upload challenge files |
 | `GET` | `/api/knowledge` | List knowledge entries |
 | `GET` | `/api/knowledge/search?q=` | Search knowledge |
+| `GET` | `/api/templates` | List reusable flow templates |
+| `GET` | `/api/tool-calls/stats` | Global tool-call statistics |
 | `GET` | `/api/tools` | List registered tools |
 | `GET` | `/api/config` | Read active config |
 | `GET` | `/api/metrics` | Metrics summary |

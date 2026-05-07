@@ -14,9 +14,9 @@ import (
 
 // SessionControls provides external control signals for a solving session.
 type SessionControls struct {
-	PauseCh   <-chan struct{} // receive when pause is requested
-	ResumeCh  <-chan struct{} // receive when resume is requested
-	InjectCh  <-chan string   // receive injected user messages
+	PauseCh  <-chan struct{} // receive when pause is requested
+	ResumeCh <-chan struct{} // receive when resume is requested
+	InjectCh <-chan string   // receive injected user messages
 }
 
 type Orchestrator struct {
@@ -28,6 +28,7 @@ type Orchestrator struct {
 	maxIter        int
 	timeout        time.Duration
 	flagPatterns   []*regexp.Regexp
+	recorder       ExecutionRecorder
 }
 
 type SolveRequest struct {
@@ -64,6 +65,10 @@ func (o *Orchestrator) SetKnowledgeStore(ks KnowledgeStore) {
 	o.knowledgeStore = ks
 }
 
+func (o *Orchestrator) SetExecutionRecorder(recorder ExecutionRecorder) {
+	o.recorder = recorder
+}
+
 func (o *Orchestrator) SetFlagPatterns(patterns []string) {
 	o.flagPatterns = nil
 	for _, p := range patterns {
@@ -81,11 +86,59 @@ func (o *Orchestrator) SolveWithCallback(req SolveRequest, log Logger) (*SolveRe
 	return o.SolveWithControls(context.Background(), req, log, nil)
 }
 
-func (o *Orchestrator) SolveWithControls(ctx context.Context, req SolveRequest, log Logger, controls *SessionControls) (*SolveResult, error) {
+func (o *Orchestrator) SolveWithControls(ctx context.Context, req SolveRequest, log Logger, controls *SessionControls) (result *SolveResult, err error) {
 	start := time.Now()
 
 	ctx, cancel := context.WithTimeout(ctx, o.timeout)
 	defer cancel()
+
+	taskID := fmt.Sprintf("orchestrator-%d", start.UnixNano())
+	if scope, ok := ExecutionScopeFromContext(ctx); ok && scope.TaskID != "" {
+		taskID = scope.TaskID
+	}
+	task := Task{
+		ID:          taskID,
+		Type:        req.ChallengeType,
+		Description: req.Description,
+		Target:      req.Target,
+		Files:       req.Files,
+	}
+	if o.recorder != nil {
+		o.recorder.AgentStarted(ctx, AgentEvent{
+			Task:      task,
+			AgentName: "Orchestrator",
+			AgentType: AgentTypePrimary,
+			StartedAt: start,
+		})
+		defer func() {
+			var agentResult *Result
+			if result != nil {
+				agentResult = &Result{
+					TaskID:     task.ID,
+					Success:    result.Success,
+					Flag:       result.Flag,
+					Error:      "",
+					Iterations: result.Iterations,
+					Duration:   result.Duration,
+				}
+				if result.Error != nil {
+					agentResult.Error = result.Error.Error()
+				}
+			}
+			errMsg := ""
+			if err != nil {
+				errMsg = err.Error()
+			}
+			o.recorder.AgentCompleted(ctx, AgentEvent{
+				Task:        task,
+				AgentName:   "Orchestrator",
+				AgentType:   AgentTypePrimary,
+				CompletedAt: time.Now(),
+				Result:      agentResult,
+				Error:       errMsg,
+			})
+		}()
+	}
 
 	if log != nil {
 		log.Log("info", "构建系统提示...")
@@ -182,12 +235,30 @@ func (o *Orchestrator) SolveWithControls(ctx context.Context, req SolveRequest, 
 		if text != "" && log != nil {
 			log.Thinking(text)
 		}
+		if text != "" && o.recorder != nil {
+			o.recorder.Thinking(ctx, ThinkingEvent{
+				TaskID:    task.ID,
+				AgentName: "Orchestrator",
+				AgentType: AgentTypePrimary,
+				Content:   text,
+				CreatedAt: time.Now(),
+			})
+		}
 
 		// Check for flag in text response
 		if flag := o.extractFlag(text); flag != "" {
 			o.logger.Info("flag found", "flag", flag)
 			if log != nil {
 				log.Flag(flag)
+			}
+			if o.recorder != nil {
+				o.recorder.FlagFound(ctx, FlagEvent{
+					TaskID:    task.ID,
+					AgentName: "Orchestrator",
+					AgentType: AgentTypePrimary,
+					Flag:      flag,
+					CreatedAt: time.Now(),
+				})
 			}
 			return &SolveResult{
 				Success:     true,
@@ -228,6 +299,21 @@ func (o *Orchestrator) SolveWithControls(ctx context.Context, req SolveRequest, 
 				if log != nil {
 					log.Log("error", errMsg)
 				}
+				if o.recorder != nil {
+					event := ToolCallEvent{
+						TaskID:      task.ID,
+						AgentName:   "Orchestrator",
+						AgentType:   AgentTypePrimary,
+						ToolUseID:   tu.ID,
+						ToolName:    tu.Name,
+						Input:       tu.Input,
+						Error:       errMsg,
+						StartedAt:   time.Now(),
+						CompletedAt: time.Now(),
+					}
+					o.recorder.ToolCallStarted(ctx, event)
+					o.recorder.ToolCallCompleted(ctx, event)
+				}
 				toolResults = append(toolResults, llm.ContentBlock{
 					Type:      "tool_result",
 					ToolUseID: tu.ID,
@@ -237,13 +323,32 @@ func (o *Orchestrator) SolveWithControls(ctx context.Context, req SolveRequest, 
 				continue
 			}
 
+			toolEvent := ToolCallEvent{
+				TaskID:    task.ID,
+				AgentName: "Orchestrator",
+				AgentType: AgentTypePrimary,
+				ToolUseID: tu.ID,
+				ToolName:  tu.Name,
+				Input:     tu.Input,
+				StartedAt: time.Now(),
+			}
+			if o.recorder != nil {
+				o.recorder.ToolCallStarted(ctx, toolEvent)
+			}
+
 			output, err := tool.Execute(ctx, tu.Input)
+			toolEvent.CompletedAt = time.Now()
 			if err != nil {
 				errMsg := fmt.Sprintf("工具执行错误: %v", err)
 				if log != nil {
 					log.Log("error", errMsg)
 				}
+				toolEvent.Error = err.Error()
 				output = errMsg
+			}
+			toolEvent.Output = output
+			if o.recorder != nil {
+				o.recorder.ToolCallCompleted(ctx, toolEvent)
 			}
 
 			if log != nil {
@@ -255,6 +360,15 @@ func (o *Orchestrator) SolveWithControls(ctx context.Context, req SolveRequest, 
 				o.logger.Info("flag found in tool output", "flag", flag)
 				if log != nil {
 					log.Flag(flag)
+				}
+				if o.recorder != nil {
+					o.recorder.FlagFound(ctx, FlagEvent{
+						TaskID:    task.ID,
+						AgentName: "Orchestrator",
+						AgentType: AgentTypePrimary,
+						Flag:      flag,
+						CreatedAt: time.Now(),
+					})
 				}
 				return &SolveResult{
 					Success:     true,

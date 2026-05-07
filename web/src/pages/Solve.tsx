@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
-import { api, UploadResult } from '@/lib/api'
+import { api, type FlowTemplate, type UploadResult } from '@/lib/api'
 import { useWebSocket, WSMessage } from '@/hooks/useWebSocket'
 import { challengeTemplates, ChallengeTemplate } from '@/data/templates'
 import { Button } from '@/components/ui/button'
@@ -37,6 +37,10 @@ export default function Solve() {
   const [result, setResult] = useState<{ flag?: string; success: boolean; error?: string } | null>(null)
   const [injectMsg, setInjectMsg] = useState('')
   const [showTemplates, setShowTemplates] = useState(false)
+  const [planWithLLM, setPlanWithLLM] = useState(false)
+  const [flowTemplates, setFlowTemplates] = useState<FlowTemplate[]>([])
+  const [selectedTemplateId, setSelectedTemplateId] = useState('')
+  const [templateLoading, setTemplateLoading] = useState(false)
   const logEndRef = useRef<HTMLDivElement>(null)
   const logIdRef = useRef(0)
   const fileInputRef = useRef<HTMLInputElement>(null)
@@ -89,6 +93,29 @@ export default function Solve() {
   useEffect(() => {
     logEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [logs])
+
+  useEffect(() => {
+    let cancelled = false
+    setTemplateLoading(true)
+    api.getTemplates(challengeType)
+      .then((items) => {
+        if (cancelled) return
+        setFlowTemplates(items)
+        setSelectedTemplateId((prev) => (
+          prev && items.some((item) => String(item.id) === prev) ? prev : ''
+        ))
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setFlowTemplates([])
+          setSelectedTemplateId('')
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setTemplateLoading(false)
+      })
+    return () => { cancelled = true }
+  }, [challengeType])
 
   const handleFileUpload = useCallback(async (fileList: FileList | File[]) => {
     setUploading(true)
@@ -152,14 +179,24 @@ export default function Solve() {
     addLog({ type: 'log', level: 'info', message: '提交解题任务...' })
 
     try {
+      const templateId = Number(selectedTemplateId)
       const res = await api.solve({
         challenge_type: challengeType,
         description,
         target,
         files: uploadedFiles.map((f) => f.path),
+        plan_with_llm: planWithLLM,
+        ...(templateId > 0 ? { template_id: templateId } : {}),
       })
       setSessionId(res.session_id)
       addLog({ type: 'log', level: 'info', message: `会话 #${res.session_id} 已创建，开始解题...` })
+      if (typeof res.planned_subtasks === 'number') {
+        addLog({
+          type: 'log',
+          level: 'info',
+          message: `初始计划已生成: ${res.planned_subtasks} 个子任务 (${res.plan_source || 'unknown'})`,
+        })
+      }
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : '未知错误'
       addLog({ type: 'error', message: `提交失败: ${msg}` })
@@ -254,6 +291,50 @@ export default function Solve() {
                 value={target}
                 onChange={(e) => setTarget(e.target.value)}
               />
+            </div>
+            <div className="space-y-3 rounded-md border bg-muted/20 p-3">
+              <div>
+                <div className="text-sm font-medium">PentAGI 风格计划</div>
+                <p className="text-xs text-muted-foreground mt-1">
+                  创建会话时生成可追踪的 Flow/Task/Subtask 初始计划，后续可在会话详情中 refinement。
+                </p>
+              </div>
+              <label className="flex items-center gap-2 text-sm">
+                <input
+                  type="checkbox"
+                  className="h-4 w-4"
+                  checked={planWithLLM}
+                  onChange={(e) => setPlanWithLLM(e.target.checked)}
+                  disabled={solving}
+                />
+                使用 LLM 生成初始计划（失败时自动回退模板解析）
+              </label>
+              <div className="space-y-2">
+                <label className="text-sm font-medium">流程模板</label>
+                <Select
+                  value={selectedTemplateId}
+                  onChange={(e) => setSelectedTemplateId(e.target.value)}
+                  disabled={solving || templateLoading || flowTemplates.length === 0}
+                >
+                  <option value="">
+                    {templateLoading
+                      ? '加载模板中...'
+                      : flowTemplates.length > 0
+                        ? '自动选择默认模板'
+                        : '暂无后端流程模板'}
+                  </option>
+                  {flowTemplates.map((template) => (
+                    <option key={template.id} value={template.id}>
+                      {template.title}
+                    </option>
+                  ))}
+                </Select>
+                {selectedTemplateId && (
+                  <p className="text-xs text-muted-foreground">
+                    {flowTemplates.find((template) => String(template.id) === selectedTemplateId)?.description}
+                  </p>
+                )}
+              </div>
             </div>
             <div className="space-y-2">
               <label className="text-sm font-medium">题目文件</label>

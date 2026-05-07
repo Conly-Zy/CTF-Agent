@@ -81,11 +81,68 @@ func (s *SQLiteStore) migrate() error {
 			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 			FOREIGN KEY (session_id) REFERENCES sessions(id)
 		)`,
+		`CREATE TABLE IF NOT EXISTS subtasks (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			session_id INTEGER NOT NULL,
+			task_id TEXT NOT NULL,
+			parent_id TEXT,
+			agent_name TEXT,
+			agent_type TEXT,
+			challenge_type TEXT,
+			title TEXT,
+			description TEXT,
+			target TEXT,
+			status TEXT DEFAULT 'created',
+			result TEXT,
+			error TEXT,
+			sort_order INTEGER DEFAULT 0,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			completed_at DATETIME,
+			FOREIGN KEY (session_id) REFERENCES sessions(id)
+		)`,
+		`CREATE TABLE IF NOT EXISTS tool_calls (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			session_id INTEGER NOT NULL,
+			subtask_id INTEGER,
+			task_id TEXT,
+			agent_name TEXT,
+			agent_type TEXT,
+			tool_use_id TEXT,
+			tool_name TEXT NOT NULL,
+			input TEXT,
+			output TEXT,
+			status TEXT DEFAULT 'received',
+			error TEXT,
+			started_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			completed_at DATETIME,
+			duration_ms INTEGER DEFAULT 0,
+			FOREIGN KEY (session_id) REFERENCES sessions(id),
+			FOREIGN KEY (subtask_id) REFERENCES subtasks(id)
+		)`,
+		`CREATE TABLE IF NOT EXISTS flow_templates (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			challenge_type TEXT NOT NULL,
+			title TEXT NOT NULL,
+			description TEXT,
+			content TEXT NOT NULL,
+			tags TEXT,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			UNIQUE(challenge_type, title)
+		)`,
 		`CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status)`,
 		`CREATE INDEX IF NOT EXISTS idx_sessions_type ON sessions(challenge_type)`,
 		`CREATE INDEX IF NOT EXISTS idx_knowledge_session ON knowledge(session_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_knowledge_type ON knowledge(type)`,
 		`CREATE INDEX IF NOT EXISTS idx_conversation_session ON conversation_messages(session_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_subtasks_session ON subtasks(session_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_subtasks_status ON subtasks(status)`,
+		`CREATE INDEX IF NOT EXISTS idx_subtasks_task ON subtasks(task_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_tool_calls_session ON tool_calls(session_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_tool_calls_subtask ON tool_calls(subtask_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_tool_calls_name ON tool_calls(tool_name)`,
+		`CREATE INDEX IF NOT EXISTS idx_flow_templates_type ON flow_templates(challenge_type)`,
 	}
 
 	for _, m := range migrations {
@@ -94,6 +151,37 @@ func (s *SQLiteStore) migrate() error {
 		}
 	}
 
+	if err := s.ensureColumn("subtasks", "sort_order", "INTEGER DEFAULT 0"); err != nil {
+		return err
+	}
+
+	return s.seedDefaultFlowTemplates()
+}
+
+func (s *SQLiteStore) ensureColumn(table, column, definition string) error {
+	rows, err := s.db.Query(fmt.Sprintf(`PRAGMA table_info(%s)`, table))
+	if err != nil {
+		return fmt.Errorf("inspect table %s: %w", table, err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notNull int
+		var defaultValue any
+		var pk int
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
+			return fmt.Errorf("scan table info %s: %w", table, err)
+		}
+		if name == column {
+			return nil
+		}
+	}
+
+	if _, err := s.db.Exec(fmt.Sprintf(`ALTER TABLE %s ADD COLUMN %s %s`, table, column, definition)); err != nil {
+		return fmt.Errorf("add column %s.%s: %w", table, column, err)
+	}
 	return nil
 }
 
@@ -399,6 +487,462 @@ func (s *SQLiteStore) GetConversationMessages(sessionID int64) ([]ConversationMe
 	return messages, nil
 }
 
+// Subtask operations
+
+func (s *SQLiteStore) CreateSubtask(st *Subtask) error {
+	now := time.Now()
+	if st.Status == "" {
+		st.Status = "created"
+	}
+	if st.Title == "" {
+		st.Title = st.Description
+	}
+	result, err := s.db.Exec(
+		`INSERT INTO subtasks (
+			session_id, task_id, parent_id, agent_name, agent_type, challenge_type,
+			title, description, target, status, result, error, sort_order, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		st.SessionID, st.TaskID, st.ParentID, st.AgentName, st.AgentType, st.ChallengeType,
+		st.Title, st.Description, st.Target, st.Status, st.Result, st.Error, st.SortOrder, now, now,
+	)
+	if err != nil {
+		return fmt.Errorf("insert subtask: %w", err)
+	}
+	id, err := result.LastInsertId()
+	if err != nil {
+		return fmt.Errorf("get subtask id: %w", err)
+	}
+	st.ID = id
+	st.CreatedAt = now
+	st.UpdatedAt = now
+	return nil
+}
+
+func (s *SQLiteStore) UpdateSubtask(st *Subtask) error {
+	now := time.Now()
+	st.UpdatedAt = now
+	_, err := s.db.Exec(
+		`UPDATE subtasks SET
+			status = ?, result = ?, error = ?, updated_at = ?, completed_at = ?
+		 WHERE id = ?`,
+		st.Status, st.Result, st.Error, now, st.CompletedAt, st.ID,
+	)
+	if err != nil {
+		return fmt.Errorf("update subtask: %w", err)
+	}
+	return nil
+}
+
+func (s *SQLiteStore) UpdateSubtaskPlan(st *Subtask) error {
+	now := time.Now()
+	st.UpdatedAt = now
+	_, err := s.db.Exec(
+		`UPDATE subtasks SET
+			task_id = ?, parent_id = ?, agent_name = ?, agent_type = ?, challenge_type = ?,
+			title = ?, description = ?, target = ?, status = ?, result = ?, error = ?,
+			sort_order = ?, updated_at = ?, completed_at = ?
+		 WHERE id = ?`,
+		st.TaskID, st.ParentID, st.AgentName, st.AgentType, st.ChallengeType,
+		st.Title, st.Description, st.Target, st.Status, st.Result, st.Error,
+		st.SortOrder, now, st.CompletedAt, st.ID,
+	)
+	if err != nil {
+		return fmt.Errorf("update subtask plan: %w", err)
+	}
+	return nil
+}
+
+func (s *SQLiteStore) DeleteSubtask(id int64) error {
+	res, err := s.db.Exec(`DELETE FROM subtasks WHERE id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("delete subtask: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("subtask %d not found", id)
+	}
+	return nil
+}
+
+func (s *SQLiteStore) ListSubtasks(sessionID int64, status string) ([]Subtask, error) {
+	query := `SELECT id, session_id, task_id, parent_id, agent_name, agent_type, challenge_type,
+		title, description, target, status, result, error, sort_order, created_at, updated_at, completed_at
+		FROM subtasks WHERE session_id = ?`
+	args := []any{sessionID}
+	if status != "" {
+		query += ` AND status = ?`
+		args = append(args, status)
+	}
+	query += ` ORDER BY sort_order ASC, id ASC`
+
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list subtasks: %w", err)
+	}
+	defer rows.Close()
+
+	var subtasks []Subtask
+	for rows.Next() {
+		st, err := scanSubtask(rows)
+		if err != nil {
+			return nil, err
+		}
+		subtasks = append(subtasks, st)
+	}
+	return subtasks, nil
+}
+
+func (s *SQLiteStore) GetSubtask(id int64) (*Subtask, error) {
+	row := s.db.QueryRow(
+		`SELECT id, session_id, task_id, parent_id, agent_name, agent_type, challenge_type,
+		title, description, target, status, result, error, sort_order, created_at, updated_at, completed_at
+		FROM subtasks WHERE id = ?`, id,
+	)
+	st, err := scanSubtask(row)
+	if err != nil {
+		return nil, fmt.Errorf("get subtask: %w", err)
+	}
+	return &st, nil
+}
+
+type subtaskScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanSubtask(scanner subtaskScanner) (Subtask, error) {
+	var st Subtask
+	var parentID, agentName, agentType, challengeType, title, description, target sql.NullString
+	var result, errMsg sql.NullString
+	var completedAt sql.NullTime
+	if err := scanner.Scan(
+		&st.ID, &st.SessionID, &st.TaskID, &parentID, &agentName, &agentType, &challengeType,
+		&title, &description, &target, &st.Status, &result, &errMsg, &st.SortOrder,
+		&st.CreatedAt, &st.UpdatedAt, &completedAt,
+	); err != nil {
+		return st, fmt.Errorf("scan subtask: %w", err)
+	}
+	st.ParentID = parentID.String
+	st.AgentName = agentName.String
+	st.AgentType = agentType.String
+	st.ChallengeType = challengeType.String
+	st.Title = title.String
+	st.Description = description.String
+	st.Target = target.String
+	st.Result = result.String
+	st.Error = errMsg.String
+	if completedAt.Valid {
+		st.CompletedAt = &completedAt.Time
+	}
+	return st, nil
+}
+
+// Tool call operations
+
+func (s *SQLiteStore) CreateToolCall(tc *ToolCall) error {
+	if tc.Status == "" {
+		tc.Status = "received"
+	}
+	if tc.StartedAt.IsZero() {
+		tc.StartedAt = time.Now()
+	}
+	result, err := s.db.Exec(
+		`INSERT INTO tool_calls (
+			session_id, subtask_id, task_id, agent_name, agent_type, tool_use_id,
+			tool_name, input, output, status, error, started_at, completed_at, duration_ms
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		tc.SessionID, tc.SubtaskID, tc.TaskID, tc.AgentName, tc.AgentType, tc.ToolUseID,
+		tc.ToolName, tc.Input, tc.Output, tc.Status, tc.Error, tc.StartedAt, tc.CompletedAt, tc.DurationMs,
+	)
+	if err != nil {
+		return fmt.Errorf("insert tool call: %w", err)
+	}
+	id, err := result.LastInsertId()
+	if err != nil {
+		return fmt.Errorf("get tool call id: %w", err)
+	}
+	tc.ID = id
+	return nil
+}
+
+func (s *SQLiteStore) CompleteToolCall(tc *ToolCall) error {
+	if tc.CompletedAt == nil {
+		now := time.Now()
+		tc.CompletedAt = &now
+	}
+	if tc.DurationMs == 0 && !tc.StartedAt.IsZero() {
+		tc.DurationMs = tc.CompletedAt.Sub(tc.StartedAt).Milliseconds()
+	}
+	_, err := s.db.Exec(
+		`UPDATE tool_calls SET output = ?, status = ?, error = ?, completed_at = ?, duration_ms = ?
+		 WHERE id = ?`,
+		tc.Output, tc.Status, tc.Error, tc.CompletedAt, tc.DurationMs, tc.ID,
+	)
+	if err != nil {
+		return fmt.Errorf("complete tool call: %w", err)
+	}
+	return nil
+}
+
+func (s *SQLiteStore) ListToolCalls(sessionID int64, limit int) ([]ToolCall, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	rows, err := s.db.Query(
+		`SELECT id, session_id, subtask_id, task_id, agent_name, agent_type, tool_use_id,
+			tool_name, input, output, status, error, started_at, completed_at, duration_ms
+		 FROM tool_calls WHERE session_id = ? ORDER BY id ASC LIMIT ?`,
+		sessionID, limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list tool calls: %w", err)
+	}
+	defer rows.Close()
+
+	var calls []ToolCall
+	for rows.Next() {
+		tc, err := scanToolCall(rows)
+		if err != nil {
+			return nil, err
+		}
+		calls = append(calls, tc)
+	}
+	return calls, nil
+}
+
+func (s *SQLiteStore) GetToolCallStats(sessionID int64) (*ToolCallStats, error) {
+	stats := &ToolCallStats{}
+
+	where := ""
+	args := []any{}
+	if sessionID > 0 {
+		where = " WHERE session_id = ?"
+		args = append(args, sessionID)
+	}
+
+	err := s.db.QueryRow(
+		`SELECT
+			COUNT(*),
+			COALESCE(SUM(CASE WHEN status = 'finished' THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(duration_ms), 0),
+			COALESCE(AVG(duration_ms), 0)
+		 FROM tool_calls`+where,
+		args...,
+	).Scan(&stats.TotalCalls, &stats.SuccessCalls, &stats.FailedCalls, &stats.TotalDurationMs, &stats.AvgDurationMs)
+	if err != nil {
+		return nil, fmt.Errorf("get tool call totals: %w", err)
+	}
+
+	byTool, err := s.getToolCallGroupStats("tool_name", where, args...)
+	if err != nil {
+		return nil, err
+	}
+	stats.ByTool = byTool
+
+	byAgent, err := s.getToolCallGroupStats("agent_name", where, args...)
+	if err != nil {
+		return nil, err
+	}
+	stats.ByAgent = byAgent
+
+	return stats, nil
+}
+
+func (s *SQLiteStore) getToolCallGroupStats(column, where string, args ...any) ([]ToolCallGroupStat, error) {
+	rows, err := s.db.Query(
+		fmt.Sprintf(`SELECT
+			COALESCE(NULLIF(%[1]s, ''), 'unknown') AS name,
+			COUNT(*) AS total_calls,
+			COALESCE(SUM(CASE WHEN status = 'finished' THEN 1 ELSE 0 END), 0) AS success_calls,
+			COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0) AS failed_calls,
+			COALESCE(SUM(duration_ms), 0) AS total_duration_ms,
+			COALESCE(AVG(duration_ms), 0) AS avg_duration_ms,
+			MAX(started_at) AS last_used
+		 FROM tool_calls%[2]s
+		 GROUP BY name
+		 ORDER BY total_calls DESC, name ASC`, column, where),
+		args...,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("get tool call group stats: %w", err)
+	}
+	defer rows.Close()
+
+	var groups []ToolCallGroupStat
+	for rows.Next() {
+		var group ToolCallGroupStat
+		var lastUsed sql.NullString
+		if err := rows.Scan(
+			&group.Name,
+			&group.TotalCalls,
+			&group.SuccessCalls,
+			&group.FailedCalls,
+			&group.TotalDurationMs,
+			&group.AvgDurationMs,
+			&lastUsed,
+		); err != nil {
+			return nil, fmt.Errorf("scan tool call group stats: %w", err)
+		}
+		if lastUsed.Valid {
+			group.LastUsed = parseSQLiteTime(lastUsed.String)
+		}
+		groups = append(groups, group)
+	}
+	return groups, nil
+}
+
+func parseSQLiteTime(value string) time.Time {
+	for _, layout := range []string{
+		time.RFC3339Nano,
+		"2006-01-02 15:04:05.999999999-07:00",
+		"2006-01-02 15:04:05.999999999Z07:00",
+		"2006-01-02 15:04:05.999999999",
+		"2006-01-02 15:04:05-07:00",
+		"2006-01-02 15:04:05Z07:00",
+		"2006-01-02 15:04:05",
+	} {
+		if ts, err := time.Parse(layout, value); err == nil {
+			return ts
+		}
+	}
+	return time.Time{}
+}
+
+type toolCallScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanToolCall(scanner toolCallScanner) (ToolCall, error) {
+	var tc ToolCall
+	var subtaskID sql.NullInt64
+	var taskID, agentName, agentType, toolUseID, input, output, status, errMsg sql.NullString
+	var completedAt sql.NullTime
+	if err := scanner.Scan(
+		&tc.ID, &tc.SessionID, &subtaskID, &taskID, &agentName, &agentType, &toolUseID,
+		&tc.ToolName, &input, &output, &status, &errMsg, &tc.StartedAt, &completedAt, &tc.DurationMs,
+	); err != nil {
+		return tc, fmt.Errorf("scan tool call: %w", err)
+	}
+	if subtaskID.Valid {
+		v := subtaskID.Int64
+		tc.SubtaskID = &v
+	}
+	tc.TaskID = taskID.String
+	tc.AgentName = agentName.String
+	tc.AgentType = agentType.String
+	tc.ToolUseID = toolUseID.String
+	tc.Input = input.String
+	tc.Output = output.String
+	tc.Status = status.String
+	tc.Error = errMsg.String
+	if completedAt.Valid {
+		tc.CompletedAt = &completedAt.Time
+	}
+	return tc, nil
+}
+
+// Flow template operations
+
+func (s *SQLiteStore) CreateFlowTemplate(tpl *FlowTemplate) error {
+	now := time.Now()
+	result, err := s.db.Exec(
+		`INSERT INTO flow_templates (challenge_type, title, description, content, tags, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		tpl.ChallengeType, tpl.Title, tpl.Description, tpl.Content, tpl.Tags, now, now,
+	)
+	if err != nil {
+		return fmt.Errorf("insert flow template: %w", err)
+	}
+	id, err := result.LastInsertId()
+	if err != nil {
+		return fmt.Errorf("get flow template id: %w", err)
+	}
+	tpl.ID = id
+	tpl.CreatedAt = now
+	tpl.UpdatedAt = now
+	return nil
+}
+
+func (s *SQLiteStore) UpdateFlowTemplate(tpl *FlowTemplate) error {
+	now := time.Now()
+	_, err := s.db.Exec(
+		`UPDATE flow_templates SET challenge_type = ?, title = ?, description = ?, content = ?, tags = ?, updated_at = ?
+		 WHERE id = ?`,
+		tpl.ChallengeType, tpl.Title, tpl.Description, tpl.Content, tpl.Tags, now, tpl.ID,
+	)
+	if err != nil {
+		return fmt.Errorf("update flow template: %w", err)
+	}
+	tpl.UpdatedAt = now
+	return nil
+}
+
+func (s *SQLiteStore) DeleteFlowTemplate(id int64) error {
+	res, err := s.db.Exec(`DELETE FROM flow_templates WHERE id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("delete flow template: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("flow template %d not found", id)
+	}
+	return nil
+}
+
+func (s *SQLiteStore) GetFlowTemplate(id int64) (*FlowTemplate, error) {
+	row := s.db.QueryRow(
+		`SELECT id, challenge_type, title, description, content, tags, created_at, updated_at
+		 FROM flow_templates WHERE id = ?`, id,
+	)
+	tpl, err := scanFlowTemplate(row)
+	if err != nil {
+		return nil, fmt.Errorf("get flow template: %w", err)
+	}
+	return &tpl, nil
+}
+
+func (s *SQLiteStore) ListFlowTemplates(challengeType string) ([]FlowTemplate, error) {
+	query := `SELECT id, challenge_type, title, description, content, tags, created_at, updated_at FROM flow_templates`
+	args := []any{}
+	if challengeType != "" {
+		query += ` WHERE challenge_type = ?`
+		args = append(args, challengeType)
+	}
+	query += ` ORDER BY challenge_type, title`
+
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list flow templates: %w", err)
+	}
+	defer rows.Close()
+
+	var templates []FlowTemplate
+	for rows.Next() {
+		tpl, err := scanFlowTemplate(rows)
+		if err != nil {
+			return nil, err
+		}
+		templates = append(templates, tpl)
+	}
+	return templates, nil
+}
+
+type flowTemplateScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanFlowTemplate(scanner flowTemplateScanner) (FlowTemplate, error) {
+	var tpl FlowTemplate
+	var description, tags sql.NullString
+	if err := scanner.Scan(
+		&tpl.ID, &tpl.ChallengeType, &tpl.Title, &description, &tpl.Content, &tags,
+		&tpl.CreatedAt, &tpl.UpdatedAt,
+	); err != nil {
+		return tpl, fmt.Errorf("scan flow template: %w", err)
+	}
+	tpl.Description = description.String
+	tpl.Tags = tags.String
+	return tpl, nil
+}
+
 // Stats
 
 func (s *SQLiteStore) GetStats() (*SessionStats, error) {
@@ -479,6 +1023,69 @@ func (s *SQLiteStore) SearchKnowledgeByType(challengeType string, limit int) ([]
 	}
 
 	return items, nil
+}
+
+func (s *SQLiteStore) seedDefaultFlowTemplates() error {
+	for _, tpl := range DefaultFlowTemplates() {
+		_, err := s.db.Exec(
+			`INSERT OR IGNORE INTO flow_templates (challenge_type, title, description, content, tags, created_at, updated_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			tpl.ChallengeType, tpl.Title, tpl.Description, tpl.Content, tpl.Tags, time.Now(), time.Now(),
+		)
+		if err != nil {
+			return fmt.Errorf("seed flow template %q: %w", tpl.Title, err)
+		}
+	}
+	return nil
+}
+
+func DefaultFlowTemplates() []FlowTemplate {
+	return []FlowTemplate{
+		{
+			ChallengeType: "web",
+			Title:         "Web CTF baseline",
+			Description:   "PentAGI-inspired ordered checklist for web challenges.",
+			Tags:          "web,recon,exploit,report",
+			Content: `1. Recon: capture headers, source, robots.txt, sitemap.xml, JavaScript, cookies, and visible routes.
+2. Discovery: enumerate paths, parameters, upload points, auth flows, and API schemas.
+3. Hypotheses: rank likely bugs such as SQLi, SSRF, path traversal, SSTI, deserialization, command injection, and auth bypass.
+4. Exploit: validate one hypothesis at a time with minimal payloads and preserve exact requests.
+5. Extraction: read or trigger the flag, then summarize the decisive primitive and replay steps.`,
+		},
+		{
+			ChallengeType: "pwn",
+			Title:         "Pwn CTF baseline",
+			Description:   "Structured binary exploitation workflow.",
+			Tags:          "pwn,binary,exploit,report",
+			Content: `1. Triage: run file/checksec, identify architecture, libc, mitigations, and run behavior.
+2. Reverse: locate input paths, dangerous calls, heap objects, format strings, and validation branches.
+3. Primitive: prove the controllable crash/leak/write and measure exact offsets.
+4. Exploit: build the shortest reliable payload, then add bypasses for canary/NX/PIE/RELRO as needed.
+5. Extraction: get shell or direct file read and record environment assumptions.`,
+		},
+		{
+			ChallengeType: "crypto",
+			Title:         "Crypto CTF baseline",
+			Description:   "Transform-chain-first workflow for crypto challenges.",
+			Tags:          "crypto,math,decode,report",
+			Content: `1. Inventory: collect ciphertexts, keys, nonces, public parameters, source, and service transcripts.
+2. Identify: determine encoding layers, primitive family, parameter sizes, randomness reuse, and oracle behavior.
+3. Attack: map observed weakness to a concrete attack such as CRT, small exponent, nonce reuse, padding oracle, or lattice.
+4. Implement: write a reproducible script with explicit parameters and intermediate assertions.
+5. Extraction: decode final plaintext and document the full transform chain.`,
+		},
+		{
+			ChallengeType: "reverse",
+			Title:         "Reverse CTF baseline",
+			Description:   "Static-to-dynamic reverse engineering workflow.",
+			Tags:          "reverse,static,dynamic,report",
+			Content: `1. Triage: record file type, strings, imports, packers, sections, entropy, and basic metadata.
+2. Locate: find input parsing, comparison, crypto/checksum routines, and success/failure branches.
+3. Model: translate the decisive transform or constraints into pseudocode.
+4. Validate: run dynamic checks, patch branches, or script the inverse transform.
+5. Extraction: recover the flag and save offsets/functions used for replay.`,
+		},
+	}
 }
 
 // Helper

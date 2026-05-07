@@ -29,8 +29,9 @@ type BaseAgent struct {
 	MessageCh      chan<- Message
 	KnowledgeStore KnowledgeStore
 	Reflector      *Reflector
-	ExecMonitor   *ExecutionMonitor
-	Summarizer    *Summarizer
+	ExecMonitor    *ExecutionMonitor
+	Summarizer     *Summarizer
+	Recorder       ExecutionRecorder
 }
 
 func NewBaseAgent(
@@ -51,8 +52,8 @@ func NewBaseAgent(
 		MaxIter:      maxIter,
 		Timeout:      timeout,
 		Reflector:    NewReflector(logger, 3),
-		ExecMonitor: NewExecutionMonitor(logger, 5, 30, 10),
-		Summarizer:  NewSummarizer(llmClient, logger, 20, 5),
+		ExecMonitor:  NewExecutionMonitor(logger, 5, 30, 10),
+		Summarizer:   NewSummarizer(llmClient, logger, 20, 5),
 	}
 }
 
@@ -70,6 +71,10 @@ func (a *BaseAgent) SetMessageChannel(ch chan<- Message) {
 
 func (a *BaseAgent) SetKnowledgeStore(ks KnowledgeStore) {
 	a.KnowledgeStore = ks
+}
+
+func (a *BaseAgent) SetExecutionRecorder(recorder ExecutionRecorder) {
+	a.Recorder = recorder
 }
 
 // BuildSystemPrompt 从模板构建系统提示词
@@ -122,11 +127,34 @@ func (a *BaseAgent) BuildSystemPrompt(task Task) (string, error) {
 }
 
 // SolveLoop 执行解题循环
-func (a *BaseAgent) SolveLoop(ctx context.Context, task Task, systemPrompt string, log Logger) (*Result, error) {
+func (a *BaseAgent) SolveLoop(ctx context.Context, task Task, systemPrompt string, log Logger) (result *Result, err error) {
 	start := time.Now()
 
 	ctx, cancel := context.WithTimeout(ctx, a.Timeout)
 	defer cancel()
+
+	if a.Recorder != nil {
+		a.Recorder.AgentStarted(ctx, AgentEvent{
+			Task:      task,
+			AgentName: a.AgentName,
+			AgentType: a.AgentType,
+			StartedAt: start,
+		})
+		defer func() {
+			errMsg := ""
+			if err != nil {
+				errMsg = err.Error()
+			}
+			a.Recorder.AgentCompleted(ctx, AgentEvent{
+				Task:        task,
+				AgentName:   a.AgentName,
+				AgentType:   a.AgentType,
+				CompletedAt: time.Now(),
+				Result:      result,
+				Error:       errMsg,
+			})
+		}()
+	}
 
 	// 获取 Agent 专用工具
 	agentTools := a.ToolRegistry.GetForAgent(tools.AgentType(a.AgentType))
@@ -247,6 +275,15 @@ func (a *BaseAgent) SolveLoop(ctx context.Context, task Task, systemPrompt strin
 		if text != "" && log != nil {
 			log.Thinking(text)
 		}
+		if text != "" && a.Recorder != nil {
+			a.Recorder.Thinking(ctx, ThinkingEvent{
+				TaskID:    task.ID,
+				AgentName: a.AgentName,
+				AgentType: a.AgentType,
+				Content:   text,
+				CreatedAt: time.Now(),
+			})
+		}
 
 		// 获取工具调用
 		toolUses := resp.GetToolUse()
@@ -307,6 +344,21 @@ func (a *BaseAgent) SolveLoop(ctx context.Context, task Task, systemPrompt strin
 				if log != nil {
 					log.Log("error", errMsg)
 				}
+				if a.Recorder != nil {
+					event := ToolCallEvent{
+						TaskID:      task.ID,
+						AgentName:   a.AgentName,
+						AgentType:   a.AgentType,
+						ToolUseID:   tu.ID,
+						ToolName:    tu.Name,
+						Input:       tu.Input,
+						Error:       errMsg,
+						StartedAt:   time.Now(),
+						CompletedAt: time.Now(),
+					}
+					a.Recorder.ToolCallStarted(ctx, event)
+					a.Recorder.ToolCallCompleted(ctx, event)
+				}
 				toolResults = append(toolResults, llm.ContentBlock{
 					Type:      "tool_result",
 					ToolUseID: tu.ID,
@@ -317,14 +369,32 @@ func (a *BaseAgent) SolveLoop(ctx context.Context, task Task, systemPrompt strin
 			}
 
 			// 执行工具
+			toolEvent := ToolCallEvent{
+				TaskID:    task.ID,
+				AgentName: a.AgentName,
+				AgentType: a.AgentType,
+				ToolUseID: tu.ID,
+				ToolName:  tu.Name,
+				Input:     tu.Input,
+				StartedAt: time.Now(),
+			}
+			if a.Recorder != nil {
+				a.Recorder.ToolCallStarted(ctx, toolEvent)
+			}
 			output, err := tool.Execute(ctx, tu.Input)
+			toolEvent.CompletedAt = time.Now()
 			if err != nil {
 				// 使用 Reflector 分析错误
 				reflectResult := a.Reflector.ReflectOnError(ctx, a.AgentName, tu.Name, err)
 				if log != nil {
 					log.Log("error", reflectResult.Message)
 				}
+				toolEvent.Error = err.Error()
 				output = reflectResult.Suggestion
+			}
+			toolEvent.Output = output
+			if a.Recorder != nil {
+				a.Recorder.ToolCallCompleted(ctx, toolEvent)
 			}
 
 			if log != nil {
@@ -336,6 +406,15 @@ func (a *BaseAgent) SolveLoop(ctx context.Context, task Task, systemPrompt strin
 				// 从输出中提取 flag
 				flag := ExtractFlagFromOutput(output)
 				if flag != "" {
+					if a.Recorder != nil {
+						a.Recorder.FlagFound(ctx, FlagEvent{
+							TaskID:    task.ID,
+							AgentName: a.AgentName,
+							AgentType: a.AgentType,
+							Flag:      flag,
+							CreatedAt: time.Now(),
+						})
+					}
 					return &Result{
 						TaskID:     task.ID,
 						Success:    true,

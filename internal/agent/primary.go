@@ -21,6 +21,7 @@ type PrimaryAgent struct {
 	maxIter      int
 	timeout      time.Duration
 	messageCh    chan<- Message
+	recorder     ExecutionRecorder
 }
 
 func NewPrimaryAgent(
@@ -52,20 +53,56 @@ func (a *PrimaryAgent) SetMessageChannel(ch chan<- Message) {
 	a.messageCh = ch
 }
 
+func (a *PrimaryAgent) SetExecutionRecorder(recorder ExecutionRecorder) {
+	a.recorder = recorder
+	for _, agent := range a.agents {
+		if aware, ok := agent.(interface{ SetExecutionRecorder(ExecutionRecorder) }); ok {
+			aware.SetExecutionRecorder(recorder)
+		}
+	}
+}
+
 // RegisterAgent 注册专业 Agent
 func (a *PrimaryAgent) RegisterAgent(agent Agent) {
 	a.agents[agent.Type()] = agent
 	agent.SetMessageChannel(a.messageCh)
+	if a.recorder != nil {
+		if aware, ok := agent.(interface{ SetExecutionRecorder(ExecutionRecorder) }); ok {
+			aware.SetExecutionRecorder(a.recorder)
+		}
+	}
 }
 
 // Run 实现 Agent 接口
-func (a *PrimaryAgent) Run(ctx context.Context, task Task) (*Result, error) {
+func (a *PrimaryAgent) Run(ctx context.Context, task Task) (result *Result, err error) {
 	start := time.Now()
 
 	ctx, cancel := context.WithTimeout(ctx, a.timeout)
 	defer cancel()
 
 	a.logger.Info("PrimaryAgent starting", "task_id", task.ID, "type", task.Type)
+	if a.recorder != nil {
+		a.recorder.AgentStarted(ctx, AgentEvent{
+			Task:      task,
+			AgentName: a.Name(),
+			AgentType: a.Type(),
+			StartedAt: start,
+		})
+		defer func() {
+			errMsg := ""
+			if err != nil {
+				errMsg = err.Error()
+			}
+			a.recorder.AgentCompleted(ctx, AgentEvent{
+				Task:        task,
+				AgentName:   a.Name(),
+				AgentType:   a.Type(),
+				CompletedAt: time.Now(),
+				Result:      result,
+				Error:       errMsg,
+			})
+		}()
+	}
 
 	// 1. 分析任务类型
 	agentType := a.analyzeTaskType(task)
@@ -172,9 +209,9 @@ func (a *PrimaryAgent) coordinateMultipleAgents(ctx context.Context, task Task, 
 			result, err := a.delegateToSpecialist(ctx, agentType, st)
 			if err != nil {
 				result = &Result{
-					TaskID: st.ID,
+					TaskID:  st.ID,
 					Success: false,
-					Error:  err.Error(),
+					Error:   err.Error(),
 				}
 			}
 			resultCh <- result

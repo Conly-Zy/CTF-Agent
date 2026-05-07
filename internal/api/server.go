@@ -22,11 +22,13 @@ import (
 	"github.com/Conly-Zy/CTF-Agent/internal/config"
 	"github.com/Conly-Zy/CTF-Agent/internal/health"
 	"github.com/Conly-Zy/CTF-Agent/internal/knowledge"
+	"github.com/Conly-Zy/CTF-Agent/internal/llm"
 	"github.com/Conly-Zy/CTF-Agent/internal/logging"
 	"github.com/Conly-Zy/CTF-Agent/internal/metrics"
+	"github.com/Conly-Zy/CTF-Agent/internal/planner"
 	"github.com/Conly-Zy/CTF-Agent/internal/plugin"
-	"github.com/Conly-Zy/CTF-Agent/internal/report"
 	"github.com/Conly-Zy/CTF-Agent/internal/replay"
+	"github.com/Conly-Zy/CTF-Agent/internal/report"
 	"github.com/Conly-Zy/CTF-Agent/internal/store"
 	"github.com/Conly-Zy/CTF-Agent/internal/taskqueue"
 	"github.com/Conly-Zy/CTF-Agent/internal/tools"
@@ -56,20 +58,32 @@ type Server struct {
 	metricsCollector *metrics.MetricsCollector
 
 	// Infrastructure
-	authenticator  *auth.Authenticator
-	rateLimiter    *auth.RateLimiter
-	cache          *cache.MemoryCache
-	healthChecker  *health.HealthChecker
-	alertManager   *alerting.AlertManager
-	logAggregator  *logging.LogAggregator
+	authenticator *auth.Authenticator
+	rateLimiter   *auth.RateLimiter
+	cache         *cache.MemoryCache
+	healthChecker *health.HealthChecker
+	alertManager  *alerting.AlertManager
+	logAggregator *logging.LogAggregator
 
 	// New features
-	taskQueue      *taskqueue.TaskQueue
-	pluginLoader   *plugin.PluginLoader
+	taskQueue     *taskqueue.TaskQueue
+	pluginLoader  *plugin.PluginLoader
+	recorder      *storeRecorder
+	planGenerator *planner.Generator
+	planRefiner   *planner.Refiner
 
 	// WebSocket clients
 	wsClients map[*websocket.Conn]bool
 	wsMu      sync.RWMutex
+}
+
+type solveRequestPayload struct {
+	ChallengeType string   `json:"challenge_type"`
+	Description   string   `json:"description"`
+	Target        string   `json:"target"`
+	Files         []string `json:"files"`
+	PlanWithLLM   bool     `json:"plan_with_llm"`
+	TemplateID    int64    `json:"template_id,omitempty"`
 }
 
 var upgrader = websocket.Upgrader{
@@ -90,6 +104,9 @@ func NewServer(store *store.SQLiteStore, logger *slog.Logger, addr string) *Serv
 		metricsCollector: metrics.NewMetricsCollector(),
 		wsClients:        make(map[*websocket.Conn]bool),
 		uploadDir:        uploadDir,
+		recorder:         newStoreRecorder(store, logger),
+		planGenerator:    planner.NewGenerator(nil),
+		planRefiner:      planner.NewRefiner(nil),
 	}
 
 	s.initInfrastructure()
@@ -119,10 +136,29 @@ func (s *Server) initInfrastructure() {
 
 func (s *Server) SetOrchestrator(o *agent.Orchestrator) {
 	s.orchestrator = o
+	if o != nil && s.recorder != nil {
+		o.SetExecutionRecorder(s.recorder)
+	}
 }
 
 func (s *Server) SetPrimaryAgent(pa *agent.PrimaryAgent) {
 	s.primaryAgent = pa
+	if pa != nil && s.recorder != nil {
+		pa.SetExecutionRecorder(s.recorder)
+	}
+}
+
+func (s *Server) SetLLMClient(client *llm.Client) {
+	if s.planGenerator == nil {
+		s.planGenerator = planner.NewGenerator(client)
+	} else {
+		s.planGenerator.SetClient(client)
+	}
+	if s.planRefiner == nil {
+		s.planRefiner = planner.NewRefiner(client)
+		return
+	}
+	s.planRefiner.SetClient(client)
 }
 
 func (s *Server) SetRegistry(r *tools.Registry) {
@@ -155,6 +191,14 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/sessions", s.handleListSessions)
 	s.mux.HandleFunc("GET /api/sessions/{id}", s.handleGetSession)
 	s.mux.HandleFunc("GET /api/sessions/{id}/messages", s.handleGetSessionMessages)
+	s.mux.HandleFunc("GET /api/sessions/{id}/plan", s.handleGetSessionPlan)
+	s.mux.HandleFunc("POST /api/sessions/{id}/plan/generate", s.handleGenerateSessionPlan)
+	s.mux.HandleFunc("POST /api/sessions/{id}/plan/patch", s.handlePatchSessionPlan)
+	s.mux.HandleFunc("POST /api/sessions/{id}/plan/suggest-patch", s.handleSuggestSessionPlanPatch)
+	s.mux.HandleFunc("POST /api/sessions/{id}/plan/refine", s.handleRefineSessionPlan)
+	s.mux.HandleFunc("GET /api/sessions/{id}/subtasks", s.handleGetSessionSubtasks)
+	s.mux.HandleFunc("GET /api/sessions/{id}/tool-calls", s.handleGetSessionToolCalls)
+	s.mux.HandleFunc("GET /api/sessions/{id}/tool-calls/stats", s.handleGetSessionToolCallStats)
 	s.mux.HandleFunc("POST /api/solve", s.handleSolve)
 	s.mux.HandleFunc("POST /api/upload", s.handleUpload)
 	s.mux.HandleFunc("POST /api/sessions/{id}/stop", s.handleStopSession)
@@ -171,11 +215,17 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/stats", s.handleStats)
 	s.mux.HandleFunc("GET /api/config", s.handleGetConfig)
 	s.mux.HandleFunc("PUT /api/config", s.handleUpdateConfig)
+	s.mux.HandleFunc("GET /api/templates", s.handleListTemplates)
+	s.mux.HandleFunc("POST /api/templates", s.handleCreateTemplate)
+	s.mux.HandleFunc("GET /api/templates/{id}", s.handleGetTemplate)
+	s.mux.HandleFunc("PUT /api/templates/{id}", s.handleUpdateTemplate)
+	s.mux.HandleFunc("DELETE /api/templates/{id}", s.handleDeleteTemplate)
 
 	// Metrics and Health
 	s.mux.HandleFunc("GET /api/metrics", s.handleMetrics)
 	s.mux.HandleFunc("GET /api/metrics/agents", s.handleAgentMetrics)
 	s.mux.HandleFunc("GET /api/metrics/tools", s.handleToolMetrics)
+	s.mux.HandleFunc("GET /api/tool-calls/stats", s.handleToolCallStats)
 	s.mux.HandleFunc("GET /api/metrics/llm", s.handleLLMMetrics)
 	s.mux.HandleFunc("GET /api/metrics/system", s.handleSystemMetrics)
 	s.mux.HandleFunc("GET /api/health", s.handleHealth)
@@ -328,12 +378,7 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleSolve(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		ChallengeType string   `json:"challenge_type"`
-		Description   string   `json:"description"`
-		Target        string   `json:"target"`
-		Files         []string `json:"files"`
-	}
+	var req solveRequestPayload
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		s.writeError(w, http.StatusBadRequest, err)
@@ -354,21 +399,20 @@ func (s *Server) handleSolve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	planned, planSource := s.createPlan(r.Context(), sess, req)
+
 	// Start solving in background
 	go s.solveAsync(sess, req)
 
 	s.writeJSON(w, map[string]any{
-		"session_id": sess.ID,
-		"status":     "solving",
+		"session_id":       sess.ID,
+		"status":           "solving",
+		"planned_subtasks": planned,
+		"plan_source":      planSource,
 	})
 }
 
-func (s *Server) solveAsync(sess *store.Session, req struct {
-	ChallengeType string   `json:"challenge_type"`
-	Description   string   `json:"description"`
-	Target        string   `json:"target"`
-	Files         []string `json:"files"`
-}) {
+func (s *Server) solveAsync(sess *store.Session, req solveRequestPayload) {
 	s.broadcast(map[string]any{
 		"type":    "log",
 		"level":   "info",
@@ -384,19 +428,132 @@ func (s *Server) solveAsync(sess *store.Session, req struct {
 		sess.Status = "failed"
 		sess.Error = "No agent configured"
 		s.store.UpdateSession(sess)
+		s.refinePlan(sess)
 		s.broadcast(map[string]any{"type": "complete", "success": false, "error": "No agent configured"})
 	}
 }
 
-func (s *Server) solveWithPrimaryAgent(sess *store.Session, req struct {
-	ChallengeType string   `json:"challenge_type"`
-	Description   string   `json:"description"`
-	Target        string   `json:"target"`
-	Files         []string `json:"files"`
-}) {
+func (s *Server) createPlan(ctx context.Context, sess *store.Session, req solveRequestPayload) (int, string) {
+	tpl := s.selectTemplate(req.ChallengeType, req.TemplateID)
+	generator := s.planGenerator
+	if generator == nil {
+		generator = planner.NewGenerator(nil)
+	}
+	result := generator.Generate(ctx, planner.GenerateRequest{
+		ChallengeType: req.ChallengeType,
+		Description:   req.Description,
+		Target:        req.Target,
+		Files:         req.Files,
+		Template:      tpl,
+	}, planner.GenerateOptions{UseLLM: req.PlanWithLLM})
+	if result.Error != "" {
+		s.logger.Warn("plan generator used fallback", "error", result.Error, "source", result.Source, "session_id", sess.ID)
+	}
+
+	existing, _ := s.loadSessionPlan(sess.ID)
+	startOrder := len(existing)
+	parentTaskID := fmt.Sprintf("session-%d", sess.ID)
+	created := 0
+	for i, step := range result.Steps {
+		order := startOrder + i + 1
+		st := &store.Subtask{
+			SessionID:     sess.ID,
+			TaskID:        fmt.Sprintf("%s-plan-%02d", parentTaskID, order),
+			ParentID:      parentTaskID,
+			AgentName:     planner.AgentName,
+			AgentType:     planner.AgentType,
+			ChallengeType: req.ChallengeType,
+			Title:         step.Title,
+			Description:   step.Description,
+			Target:        req.Target,
+			Status:        planner.StatusPlanned,
+			SortOrder:     order,
+		}
+		if step.Source != "" {
+			st.Result = fmt.Sprintf("Generated from template: %s", step.Source)
+		}
+		if err := s.store.CreateSubtask(st); err != nil {
+			s.logger.Warn("failed to persist planned subtask", "error", err, "session_id", sess.ID, "step", step.Title)
+			continue
+		}
+		created++
+	}
+	if created > 0 {
+		s.broadcast(map[string]any{
+			"type":       "plan",
+			"session_id": sess.ID,
+			"count":      created,
+		})
+	}
+	return created, result.Source
+}
+
+func (s *Server) selectTemplate(challengeType string, templateID int64) *store.FlowTemplate {
+	if templateID > 0 {
+		tpl, err := s.store.GetFlowTemplate(templateID)
+		if err != nil {
+			s.logger.Warn("requested flow template not found", "error", err, "template_id", templateID)
+			return nil
+		}
+		return tpl
+	}
+	templates, err := s.store.ListFlowTemplates(challengeType)
+	if err != nil {
+		s.logger.Warn("failed to load flow templates for planning", "error", err, "challenge_type", challengeType)
+		return nil
+	}
+	if len(templates) == 0 {
+		return nil
+	}
+	return &templates[0]
+}
+
+func (s *Server) refinePlan(sess *store.Session) {
+	planned, err := s.store.ListSubtasks(sess.ID, planner.StatusPlanned)
+	if err != nil {
+		s.logger.Warn("failed to load planned subtasks for refinement", "error", err, "session_id", sess.ID)
+		return
+	}
+	if len(planned) == 0 {
+		return
+	}
+
+	toolCalls, err := s.store.ListToolCalls(sess.ID, 10000)
+	if err != nil {
+		s.logger.Warn("failed to load tool calls for plan refinement", "error", err, "session_id", sess.ID)
+	}
+
+	refined := 0
+	completedAt := time.Now()
+	for _, st := range planned {
+		status, result, errMsg := planner.RefineStatus(sess, st, toolCalls)
+		st.Status = status
+		st.Result = result
+		st.Error = errMsg
+		st.CompletedAt = &completedAt
+		if err := s.store.UpdateSubtask(&st); err != nil {
+			s.logger.Warn("failed to update planned subtask", "error", err, "subtask_id", st.ID)
+			continue
+		}
+		refined++
+	}
+	if refined > 0 {
+		s.broadcast(map[string]any{
+			"type":       "plan_refined",
+			"session_id": sess.ID,
+			"count":      refined,
+		})
+	}
+}
+
+func (s *Server) solveWithPrimaryAgent(sess *store.Session, req solveRequestPayload) {
 	// Create cancellable context and register with session manager
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	ctx = agent.WithExecutionScope(ctx, agent.ExecutionScope{
+		SessionID: sess.ID,
+		TaskID:    fmt.Sprintf("session-%d", sess.ID),
+	})
 
 	s.activeSessions.Register(sess.ID, cancel)
 	defer s.activeSessions.Remove(sess.ID)
@@ -417,16 +574,24 @@ func (s *Server) solveWithPrimaryAgent(sess *store.Session, req struct {
 		sess.Status = "failed"
 		sess.Error = err.Error()
 		s.store.UpdateSession(sess)
+		s.refinePlan(sess)
 		s.broadcast(map[string]any{"type": "complete", "success": false, "error": err.Error()})
 		return
 	}
 
-	sess.Status = "success"
+	if result.Success {
+		sess.Status = "success"
+	} else {
+		sess.Status = "failed"
+	}
 	sess.Flag = result.Flag
 	sess.Iterations = result.Iterations
+	sess.DurationMs = result.Duration.Milliseconds()
+	sess.Error = result.Error
 	completedAt := time.Now()
 	sess.CompletedAt = &completedAt
 	s.store.UpdateSession(sess)
+	s.refinePlan(sess)
 
 	// Extract knowledge
 	messages, _ := s.store.GetConversationMessages(sess.ID)
@@ -434,22 +599,21 @@ func (s *Server) solveWithPrimaryAgent(sess *store.Session, req struct {
 
 	s.broadcast(map[string]any{
 		"type":       "complete",
-		"success":    true,
+		"success":    result.Success,
 		"flag":       result.Flag,
 		"iterations": result.Iterations,
 		"duration":   result.Duration.String(),
 	})
 }
 
-func (s *Server) solveWithOrchestrator(sess *store.Session, req struct {
-	ChallengeType string   `json:"challenge_type"`
-	Description   string   `json:"description"`
-	Target        string   `json:"target"`
-	Files         []string `json:"files"`
-}) {
+func (s *Server) solveWithOrchestrator(sess *store.Session, req solveRequestPayload) {
 	// Create cancellable context and register with session manager
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	ctx = agent.WithExecutionScope(ctx, agent.ExecutionScope{
+		SessionID: sess.ID,
+		TaskID:    fmt.Sprintf("session-%d", sess.ID),
+	})
 
 	active := s.activeSessions.Register(sess.ID, cancel)
 	defer s.activeSessions.Remove(sess.ID)
@@ -479,16 +643,26 @@ func (s *Server) solveWithOrchestrator(sess *store.Session, req struct {
 		sess.Status = "failed"
 		sess.Error = err.Error()
 		s.store.UpdateSession(sess)
+		s.refinePlan(sess)
 		s.broadcast(map[string]any{"type": "complete", "success": false, "error": err.Error()})
 		return
 	}
 
-	sess.Status = "success"
+	if result.Success {
+		sess.Status = "success"
+	} else {
+		sess.Status = "failed"
+	}
 	sess.Flag = result.Flag
 	sess.Iterations = result.Iterations
+	sess.DurationMs = result.Duration.Milliseconds()
+	if result.Error != nil {
+		sess.Error = result.Error.Error()
+	}
 	completedAt := result.CompletedAt
 	sess.CompletedAt = &completedAt
 	s.store.UpdateSession(sess)
+	s.refinePlan(sess)
 
 	// Extract knowledge
 	messages, _ := s.store.GetConversationMessages(sess.ID)
@@ -496,7 +670,7 @@ func (s *Server) solveWithOrchestrator(sess *store.Session, req struct {
 
 	s.broadcast(map[string]any{
 		"type":       "complete",
-		"success":    true,
+		"success":    result.Success,
 		"flag":       result.Flag,
 		"iterations": result.Iterations,
 		"duration":   result.Duration.String(),
@@ -516,9 +690,15 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	toolStats, err := s.store.GetToolCallStats(0)
+	if err != nil {
+		s.logger.Warn("failed to load tool call stats", "error", err)
+	}
+
 	s.writeJSON(w, map[string]any{
-		"stats":    stats,
-		"sessions": sessions,
+		"stats":           stats,
+		"sessions":        sessions,
+		"tool_call_stats": toolStats,
 	})
 }
 
@@ -569,6 +749,346 @@ func (s *Server) handleGetSessionMessages(w http.ResponseWriter, r *http.Request
 	}
 
 	s.writeJSON(w, messages)
+}
+
+func (s *Server) handleGetSessionPlan(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		s.writeError(w, http.StatusBadRequest, fmt.Errorf("invalid id"))
+		return
+	}
+
+	status := r.URL.Query().Get("status")
+	subtasks, err := s.store.ListSubtasks(id, "")
+	if err != nil {
+		s.writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	plan := make([]store.Subtask, 0)
+	for _, st := range subtasks {
+		if st.AgentType != planner.AgentType {
+			continue
+		}
+		if status != "" && st.Status != status {
+			continue
+		}
+		plan = append(plan, st)
+	}
+	s.writeJSON(w, plan)
+}
+
+func (s *Server) handleGenerateSessionPlan(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		s.writeError(w, http.StatusBadRequest, fmt.Errorf("invalid id"))
+		return
+	}
+	session, err := s.store.GetSession(id)
+	if err != nil {
+		s.writeError(w, http.StatusNotFound, fmt.Errorf("session not found"))
+		return
+	}
+
+	var req solveRequestPayload
+	if r.Body != nil {
+		_ = json.NewDecoder(r.Body).Decode(&req)
+	}
+	if req.ChallengeType == "" {
+		req.ChallengeType = session.ChallengeType
+	}
+	if req.Description == "" {
+		req.Description = session.Description
+	}
+	if req.Target == "" {
+		req.Target = session.Target
+	}
+	if len(req.Files) == 0 && session.Files != "" {
+		_ = json.Unmarshal([]byte(session.Files), &req.Files)
+	}
+	if req.TemplateID == 0 {
+		if templateID, _ := strconv.ParseInt(r.URL.Query().Get("template_id"), 10, 64); templateID > 0 {
+			req.TemplateID = templateID
+		}
+	}
+	if parseBoolQuery(r, "llm") {
+		req.PlanWithLLM = true
+	}
+
+	if parseBoolQuery(r, "replace") {
+		current, err := s.loadSessionPlan(id)
+		if err != nil {
+			s.writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		for _, st := range current {
+			if err := s.store.DeleteSubtask(st.ID); err != nil {
+				s.writeError(w, http.StatusInternalServerError, err)
+				return
+			}
+		}
+	}
+
+	count, source := s.createPlan(r.Context(), session, req)
+	plan, err := s.loadSessionPlan(id)
+	if err != nil {
+		s.writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	s.broadcast(map[string]any{
+		"type":       "plan_generated",
+		"session_id": id,
+		"count":      count,
+		"source":     source,
+	})
+	s.writeJSON(w, map[string]any{
+		"created": count,
+		"source":  source,
+		"plan":    plan,
+	})
+}
+
+func (s *Server) handleRefineSessionPlan(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		s.writeError(w, http.StatusBadRequest, fmt.Errorf("invalid id"))
+		return
+	}
+
+	session, err := s.store.GetSession(id)
+	if err != nil {
+		s.writeError(w, http.StatusNotFound, fmt.Errorf("session not found"))
+		return
+	}
+	s.refinePlan(session)
+
+	subtasks, err := s.store.ListSubtasks(id, "")
+	if err != nil {
+		s.writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	plan := make([]store.Subtask, 0)
+	for _, st := range subtasks {
+		if st.AgentType == planner.AgentType {
+			plan = append(plan, st)
+		}
+	}
+	s.writeJSON(w, plan)
+}
+
+func (s *Server) handlePatchSessionPlan(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		s.writeError(w, http.StatusBadRequest, fmt.Errorf("invalid id"))
+		return
+	}
+
+	session, err := s.store.GetSession(id)
+	if err != nil {
+		s.writeError(w, http.StatusNotFound, fmt.Errorf("session not found"))
+		return
+	}
+
+	var patch planner.Patch
+	if err := json.NewDecoder(r.Body).Decode(&patch); err != nil {
+		s.writeError(w, http.StatusBadRequest, err)
+		return
+	}
+
+	current, err := s.loadSessionPlan(id)
+	if err != nil {
+		s.writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	updated, err := planner.ApplyPatch(current, patch, planner.PatchOptions{
+		SessionID:     id,
+		ParentTaskID:  fmt.Sprintf("session-%d", id),
+		ChallengeType: session.ChallengeType,
+		Target:        session.Target,
+	})
+	if err != nil {
+		s.writeError(w, http.StatusBadRequest, err)
+		return
+	}
+
+	if err := s.persistPlanPatch(current, updated); err != nil {
+		s.writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	plan, err := s.loadSessionPlan(id)
+	if err != nil {
+		s.writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	s.broadcast(map[string]any{
+		"type":       "plan_patched",
+		"session_id": id,
+		"count":      len(plan),
+	})
+	s.writeJSON(w, plan)
+}
+
+func (s *Server) handleSuggestSessionPlanPatch(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		s.writeError(w, http.StatusBadRequest, fmt.Errorf("invalid id"))
+		return
+	}
+
+	session, err := s.store.GetSession(id)
+	if err != nil {
+		s.writeError(w, http.StatusNotFound, fmt.Errorf("session not found"))
+		return
+	}
+	plan, err := s.loadSessionPlan(id)
+	if err != nil {
+		s.writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	toolCalls, err := s.store.ListToolCalls(id, 10000)
+	if err != nil {
+		s.writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	useLLM := parseBoolQuery(r, "llm")
+	applyPatch := parseBoolQuery(r, "apply")
+	refiner := s.planRefiner
+	if refiner == nil {
+		refiner = planner.NewRefiner(nil)
+	}
+	result := refiner.SuggestPatch(r.Context(), planner.Evidence{
+		Session:   session,
+		Plan:      plan,
+		ToolCalls: toolCalls,
+	}, planner.SuggestOptions{UseLLM: useLLM})
+
+	response := map[string]any{
+		"suggestion": result,
+		"applied":    false,
+	}
+	if applyPatch && len(result.Patch.Operations) > 0 {
+		updated, err := planner.ApplyPatch(plan, result.Patch, planner.PatchOptions{
+			SessionID:     id,
+			ParentTaskID:  fmt.Sprintf("session-%d", id),
+			ChallengeType: session.ChallengeType,
+			Target:        session.Target,
+		})
+		if err != nil {
+			s.writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		if err := s.persistPlanPatch(plan, updated); err != nil {
+			s.writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		appliedPlan, err := s.loadSessionPlan(id)
+		if err != nil {
+			s.writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		response["applied"] = true
+		response["plan"] = appliedPlan
+		s.broadcast(map[string]any{
+			"type":       "plan_patch_suggested_applied",
+			"session_id": id,
+			"source":     result.Source,
+			"count":      len(appliedPlan),
+		})
+	}
+
+	s.writeJSON(w, response)
+}
+
+func (s *Server) loadSessionPlan(sessionID int64) ([]store.Subtask, error) {
+	subtasks, err := s.store.ListSubtasks(sessionID, "")
+	if err != nil {
+		return nil, err
+	}
+	plan := make([]store.Subtask, 0)
+	for _, st := range subtasks {
+		if st.AgentType == planner.AgentType {
+			plan = append(plan, st)
+		}
+	}
+	return plan, nil
+}
+
+func (s *Server) persistPlanPatch(current, updated []store.Subtask) error {
+	updatedIDs := make(map[int64]bool, len(updated))
+	for i := range updated {
+		updated[i].SortOrder = i + 1
+		if updated[i].ID == 0 {
+			if err := s.store.CreateSubtask(&updated[i]); err != nil {
+				return err
+			}
+			continue
+		}
+		updatedIDs[updated[i].ID] = true
+		if err := s.store.UpdateSubtaskPlan(&updated[i]); err != nil {
+			return err
+		}
+	}
+
+	for _, st := range current {
+		if st.ID != 0 && !updatedIDs[st.ID] {
+			if err := s.store.DeleteSubtask(st.ID); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (s *Server) handleGetSessionSubtasks(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		s.writeError(w, http.StatusBadRequest, fmt.Errorf("invalid id"))
+		return
+	}
+
+	status := r.URL.Query().Get("status")
+	subtasks, err := s.store.ListSubtasks(id, status)
+	if err != nil {
+		s.writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	s.writeJSON(w, subtasks)
+}
+
+func (s *Server) handleGetSessionToolCalls(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		s.writeError(w, http.StatusBadRequest, fmt.Errorf("invalid id"))
+		return
+	}
+
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	if limit <= 0 {
+		limit = 200
+	}
+	calls, err := s.store.ListToolCalls(id, limit)
+	if err != nil {
+		s.writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	s.writeJSON(w, calls)
+}
+
+func (s *Server) handleGetSessionToolCallStats(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		s.writeError(w, http.StatusBadRequest, fmt.Errorf("invalid id"))
+		return
+	}
+	stats, err := s.store.GetToolCallStats(id)
+	if err != nil {
+		s.writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	s.writeJSON(w, stats)
 }
 
 // Session control handlers
@@ -802,6 +1322,97 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, stats)
 }
 
+// Flow template handlers
+func (s *Server) handleListTemplates(w http.ResponseWriter, r *http.Request) {
+	challengeType := r.URL.Query().Get("type")
+	templates, err := s.store.ListFlowTemplates(challengeType)
+	if err != nil {
+		s.writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	s.writeJSON(w, templates)
+}
+
+func (s *Server) handleGetTemplate(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		s.writeError(w, http.StatusBadRequest, fmt.Errorf("invalid id"))
+		return
+	}
+	tpl, err := s.store.GetFlowTemplate(id)
+	if err != nil {
+		s.writeError(w, http.StatusNotFound, fmt.Errorf("template not found"))
+		return
+	}
+	s.writeJSON(w, tpl)
+}
+
+func (s *Server) handleCreateTemplate(w http.ResponseWriter, r *http.Request) {
+	var tpl store.FlowTemplate
+	if err := json.NewDecoder(r.Body).Decode(&tpl); err != nil {
+		s.writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := validateTemplate(&tpl); err != nil {
+		s.writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := s.store.CreateFlowTemplate(&tpl); err != nil {
+		s.writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	s.writeJSON(w, tpl)
+}
+
+func (s *Server) handleUpdateTemplate(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		s.writeError(w, http.StatusBadRequest, fmt.Errorf("invalid id"))
+		return
+	}
+	var tpl store.FlowTemplate
+	if err := json.NewDecoder(r.Body).Decode(&tpl); err != nil {
+		s.writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	tpl.ID = id
+	if err := validateTemplate(&tpl); err != nil {
+		s.writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := s.store.UpdateFlowTemplate(&tpl); err != nil {
+		s.writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	s.writeJSON(w, tpl)
+}
+
+func (s *Server) handleDeleteTemplate(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		s.writeError(w, http.StatusBadRequest, fmt.Errorf("invalid id"))
+		return
+	}
+	if err := s.store.DeleteFlowTemplate(id); err != nil {
+		s.writeError(w, http.StatusNotFound, err)
+		return
+	}
+	s.writeJSON(w, map[string]any{"ok": true})
+}
+
+func validateTemplate(tpl *store.FlowTemplate) error {
+	if strings.TrimSpace(tpl.ChallengeType) == "" {
+		return fmt.Errorf("challenge_type is required")
+	}
+	if strings.TrimSpace(tpl.Title) == "" {
+		return fmt.Errorf("title is required")
+	}
+	if strings.TrimSpace(tpl.Content) == "" {
+		return fmt.Errorf("content is required")
+	}
+	return nil
+}
+
 // Config handlers
 func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 	if s.cfg == nil {
@@ -940,6 +1551,15 @@ func (s *Server) writeError(w http.ResponseWriter, status int, err error) {
 	json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 }
 
+func parseBoolQuery(r *http.Request, key string) bool {
+	switch strings.ToLower(strings.TrimSpace(r.URL.Query().Get(key))) {
+	case "1", "true", "yes", "y", "on":
+		return true
+	default:
+		return false
+	}
+}
+
 // WebSocket logger
 type wsLogger struct {
 	server *Server
@@ -1019,6 +1639,15 @@ func (s *Server) handleAgentMetrics(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleToolMetrics(w http.ResponseWriter, r *http.Request) {
 	metrics := s.metricsCollector.GetAllToolMetrics()
 	s.writeJSON(w, metrics)
+}
+
+func (s *Server) handleToolCallStats(w http.ResponseWriter, r *http.Request) {
+	stats, err := s.store.GetToolCallStats(0)
+	if err != nil {
+		s.writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	s.writeJSON(w, stats)
 }
 
 func (s *Server) handleLLMMetrics(w http.ResponseWriter, r *http.Request) {
@@ -1244,12 +1873,12 @@ func (s *Server) handleGetReport(w http.ResponseWriter, r *http.Request) {
 
 	gen := report.NewReportGenerator()
 
-	// Try to load replay for richer report
-	replayPath := filepath.Join("/tmp/ctf-agent-replays", fmt.Sprintf("session-%d.json", id))
-	rp, err := replay.LoadReplay(replayPath)
-
 	var rpt *report.Report
-	if err == nil {
+	subtasks, subtaskErr := s.store.ListSubtasks(id, "")
+	toolCalls, toolErr := s.store.ListToolCalls(id, 10000)
+	if subtaskErr == nil && toolErr == nil && (len(subtasks) > 0 || len(toolCalls) > 0) {
+		rpt = gen.GenerateFromEvidence(session, subtasks, toolCalls)
+	} else if rp, err := replay.LoadReplay(filepath.Join("/tmp/ctf-agent-replays", fmt.Sprintf("session-%d.json", id))); err == nil {
 		rpt = gen.GenerateFromReplay(session, rp)
 	} else {
 		rpt = gen.GenerateFromSession(session)

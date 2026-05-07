@@ -110,6 +110,9 @@ func runServer(cmd *cobra.Command, args []string) error {
 	if primaryAgent != nil {
 		server.SetPrimaryAgent(primaryAgent)
 	}
+	if llmClient != nil {
+		server.SetLLMClient(llmClient)
+	}
 	server.SetRegistry(registry)
 	server.SetConfig(cfg)
 

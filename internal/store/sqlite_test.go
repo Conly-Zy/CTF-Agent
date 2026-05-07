@@ -259,3 +259,161 @@ func TestGetStats(t *testing.T) {
 		t.Errorf("expected 1 pwn session, got %d", stats.ByType["pwn"])
 	}
 }
+
+func TestSubtaskOperations(t *testing.T) {
+	store := setupTestDB(t)
+	sess := &Session{ChallengeType: "web", Status: "solving", CreatedAt: time.Now()}
+	if err := store.CreateSession(sess); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	st := &Subtask{
+		SessionID:     sess.ID,
+		TaskID:        "task-1",
+		AgentName:     "WebAgent",
+		AgentType:     "web",
+		ChallengeType: "web",
+		Description:   "Enumerate routes",
+		Status:        "running",
+		SortOrder:     2,
+	}
+	if err := store.CreateSubtask(st); err != nil {
+		t.Fatalf("create subtask: %v", err)
+	}
+	if st.ID == 0 {
+		t.Fatal("expected subtask id")
+	}
+
+	completedAt := time.Now()
+	st.Status = "success"
+	st.Result = "found /admin"
+	st.CompletedAt = &completedAt
+	if err := store.UpdateSubtask(st); err != nil {
+		t.Fatalf("update subtask: %v", err)
+	}
+
+	items, err := store.ListSubtasks(sess.ID, "success")
+	if err != nil {
+		t.Fatalf("list subtasks: %v", err)
+	}
+	if len(items) != 1 || items[0].Result != "found /admin" {
+		t.Fatalf("unexpected subtasks: %+v", items)
+	}
+
+	plan := &Subtask{
+		ID:            st.ID,
+		SessionID:     sess.ID,
+		TaskID:        "task-1",
+		AgentName:     "Planner",
+		AgentType:     "planner",
+		ChallengeType: "web",
+		Title:         "Updated plan",
+		Description:   "updated",
+		Status:        "planned",
+		SortOrder:     1,
+	}
+	if err := store.UpdateSubtaskPlan(plan); err != nil {
+		t.Fatalf("update subtask plan: %v", err)
+	}
+	got, err := store.GetSubtask(st.ID)
+	if err != nil {
+		t.Fatalf("get subtask: %v", err)
+	}
+	if got.Title != "Updated plan" || got.SortOrder != 1 || got.AgentType != "planner" {
+		t.Fatalf("unexpected updated plan: %+v", got)
+	}
+}
+
+func TestToolCallOperations(t *testing.T) {
+	store := setupTestDB(t)
+	sess := &Session{ChallengeType: "web", Status: "solving", CreatedAt: time.Now()}
+	if err := store.CreateSession(sess); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	call := &ToolCall{
+		SessionID: sess.ID,
+		TaskID:    "task-1",
+		AgentName: "WebAgent",
+		AgentType: "web",
+		ToolUseID: "toolu_test",
+		ToolName:  "http_request",
+		Input:     `{"url":"http://example.com"}`,
+		Status:    "running",
+		StartedAt: time.Now(),
+	}
+	if err := store.CreateToolCall(call); err != nil {
+		t.Fatalf("create tool call: %v", err)
+	}
+	completedAt := time.Now()
+	call.Output = "HTTP/1.1 200 OK"
+	call.Status = "finished"
+	call.CompletedAt = &completedAt
+	if err := store.CompleteToolCall(call); err != nil {
+		t.Fatalf("complete tool call: %v", err)
+	}
+
+	calls, err := store.ListToolCalls(sess.ID, 10)
+	if err != nil {
+		t.Fatalf("list tool calls: %v", err)
+	}
+	if len(calls) != 1 || calls[0].ToolName != "http_request" || calls[0].Status != "finished" {
+		t.Fatalf("unexpected tool calls: %+v", calls)
+	}
+
+	stats, err := store.GetToolCallStats(sess.ID)
+	if err != nil {
+		t.Fatalf("get tool call stats: %v", err)
+	}
+	if stats.TotalCalls != 1 || stats.SuccessCalls != 1 || stats.FailedCalls != 0 {
+		t.Fatalf("unexpected stats: %+v", stats)
+	}
+	if len(stats.ByTool) != 1 || stats.ByTool[0].Name != "http_request" {
+		t.Fatalf("unexpected by_tool stats: %+v", stats.ByTool)
+	}
+	if len(stats.ByAgent) != 1 || stats.ByAgent[0].Name != "WebAgent" {
+		t.Fatalf("unexpected by_agent stats: %+v", stats.ByAgent)
+	}
+}
+
+func TestFlowTemplateOperations(t *testing.T) {
+	store := setupTestDB(t)
+
+	defaults, err := store.ListFlowTemplates("web")
+	if err != nil {
+		t.Fatalf("list default templates: %v", err)
+	}
+	if len(defaults) == 0 {
+		t.Fatal("expected seeded web templates")
+	}
+
+	tpl := &FlowTemplate{
+		ChallengeType: "misc",
+		Title:         "Custom misc playbook",
+		Description:   "custom",
+		Content:       "1. inspect artifacts\n2. recover flag",
+		Tags:          "misc,custom",
+	}
+	if err := store.CreateFlowTemplate(tpl); err != nil {
+		t.Fatalf("create template: %v", err)
+	}
+	if tpl.ID == 0 {
+		t.Fatal("expected template id")
+	}
+
+	tpl.Title = "Updated misc playbook"
+	if err := store.UpdateFlowTemplate(tpl); err != nil {
+		t.Fatalf("update template: %v", err)
+	}
+	got, err := store.GetFlowTemplate(tpl.ID)
+	if err != nil {
+		t.Fatalf("get template: %v", err)
+	}
+	if got.Title != "Updated misc playbook" {
+		t.Fatalf("unexpected title: %q", got.Title)
+	}
+
+	if err := store.DeleteFlowTemplate(tpl.ID); err != nil {
+		t.Fatalf("delete template: %v", err)
+	}
+}

@@ -3,7 +3,7 @@ import { api, DashboardData } from '@/lib/api'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { challengeTypeLabel, statusLabel, formatDuration, formatDate } from '@/lib/utils'
-import { Activity, CheckCircle, XCircle, Clock } from 'lucide-react'
+import { Activity, CheckCircle, XCircle, Clock, Wrench } from 'lucide-react'
 
 export default function Dashboard() {
   const [data, setData] = useState<DashboardData | null>(null)
@@ -18,6 +18,7 @@ export default function Dashboard() {
 
   const { stats } = data
   const sessions = data.sessions || []
+  const toolStats = data.tool_call_stats
   const successRate = stats.total_sessions > 0
     ? ((stats.success_sessions / stats.total_sessions) * 100).toFixed(1)
     : '0'
@@ -28,13 +29,21 @@ export default function Dashboard() {
     { title: '失败数', value: stats.failed_sessions, icon: XCircle, color: 'text-red-600' },
     { title: '平均耗时', value: formatDuration(stats.avg_duration_ms), icon: Clock, color: 'text-yellow-600' },
   ]
+  if (toolStats) {
+    statCards.push({
+      title: '工具调用',
+      value: toolStats.total_calls,
+      icon: Wrench,
+      color: 'text-purple-600',
+    })
+  }
 
   return (
     <div className="p-6 space-y-6">
       <h1 className="text-2xl font-semibold">仪表盘</h1>
 
       {/* Stat cards */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4">
         {statCards.map(({ title, value, icon: Icon, color }) => (
           <Card key={title}>
             <CardHeader className="flex flex-row items-center justify-between pb-2">
@@ -67,6 +76,51 @@ export default function Dashboard() {
           </div>
         </CardContent>
       </Card>
+
+      {/* Tool evidence stats */}
+      {toolStats && (
+        <Card>
+          <CardHeader>
+            <CardTitle>工具调用证据</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-4">
+              <div>
+                <div className="text-xs text-muted-foreground">成功/失败</div>
+                <div className="text-xl font-bold">{toolStats.success_calls}/{toolStats.failed_calls}</div>
+              </div>
+              <div>
+                <div className="text-xs text-muted-foreground">平均耗时</div>
+                <div className="text-xl font-bold">
+                  {formatDuration(Math.round(toolStats.avg_duration_ms || 0))}
+                </div>
+              </div>
+              <div>
+                <div className="text-xs text-muted-foreground">累计耗时</div>
+                <div className="text-xl font-bold">{formatDuration(toolStats.total_duration_ms || 0)}</div>
+              </div>
+            </div>
+            <div className="space-y-2">
+              {toolStats.by_tool.slice(0, 6).map((tool) => (
+                <div key={tool.name} className="flex items-center justify-between text-sm border-b last:border-0 pb-2">
+                  <div className="flex items-center gap-2">
+                    <Badge variant="outline">{tool.name || '(unknown)'}</Badge>
+                    <span className="text-xs text-muted-foreground">
+                      success {tool.success_calls} / failed {tool.failed_calls}
+                    </span>
+                  </div>
+                  <span className="text-xs text-muted-foreground">
+                    {tool.total_calls} 次 · avg {formatDuration(Math.round(tool.avg_duration_ms || 0))}
+                  </span>
+                </div>
+              ))}
+              {toolStats.by_tool.length === 0 && (
+                <p className="text-sm text-muted-foreground">暂无工具调用数据</p>
+              )}
+            </div>
+          </CardContent>
+        </Card>
+      )}
 
       {/* Recent sessions */}
       <Card>

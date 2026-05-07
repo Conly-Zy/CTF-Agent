@@ -14,6 +14,7 @@ CTF-Agent 是一个面向 CTF 竞赛/靶场的 AI 辅助解题平台，提供 CL
 - **多模型提供者**：支持 Anthropic Claude 与 OpenAI 兼容的 chat-completions 接口。
 - **Web 控制台**：仪表盘、会话、实时解题、工具测试、知识库搜索、配置编辑、指标、日志、告警、回放与报告。
 - **知识库**：从解题过程自动提取技巧、标签、命令与代码片段，便于复用。
+- **流程证据模型**：借鉴 PentAGI 的 Flow 设计，持久化会话子任务、工具调用轨迹和可复用解题模板。
 - **沙箱支持**：提供 Docker 执行辅助能力，降低分析题目时的环境污染风险。
 - **全新环境一键启动**：使用 `./scripts/bootstrap.sh` 自动创建配置并启动 GHCR 镜像。
 - **CI/CD**：GitHub Actions 自动构建二进制、发布 Release，并生成多架构 Docker 镜像。
@@ -236,6 +237,7 @@ flowchart TD
     Tools --> Sandbox[Docker 沙箱]
     API --> Store[(SQLite 存储)]
     Store --> Knowledge[知识库]
+    Store --> Evidence[子任务 / 工具调用 / 模板]
     API --> Metrics[指标/健康检查/日志/告警]
 ```
 
@@ -247,10 +249,20 @@ flowchart TD
 | `GET` | `/api/sessions` | 会话列表 |
 | `GET` | `/api/sessions/{id}` | 会话详情 |
 | `GET` | `/api/sessions/{id}/messages` | 会话对话消息 |
-| `POST` | `/api/solve` | 创建解题任务 |
+| `GET` | `/api/sessions/{id}/plan` | 生成/修正后的解题计划 |
+| `POST` | `/api/sessions/{id}/plan/generate` | 生成或重新生成会话计划 |
+| `POST` | `/api/sessions/{id}/plan/patch` | 增删改/重排解题计划 |
+| `POST` | `/api/sessions/{id}/plan/suggest-patch` | 建议确定性/LLM 计划补丁 |
+| `POST` | `/api/sessions/{id}/plan/refine` | 重新修正持久化解题计划 |
+| `GET` | `/api/sessions/{id}/subtasks` | 会话 Agent 子任务 |
+| `GET` | `/api/sessions/{id}/tool-calls` | 会话工具调用轨迹 |
+| `GET` | `/api/sessions/{id}/tool-calls/stats` | 会话工具调用统计 |
+| `POST` | `/api/solve` | 创建解题任务，支持 `plan_with_llm` 和 `template_id` |
 | `POST` | `/api/upload` | 上传题目文件 |
 | `GET` | `/api/knowledge` | 知识条目列表 |
 | `GET` | `/api/knowledge/search?q=` | 搜索知识库 |
+| `GET` | `/api/templates` | 可复用解题流程模板 |
+| `GET` | `/api/tool-calls/stats` | 全局工具调用统计 |
 | `GET` | `/api/tools` | 工具列表 |
 | `GET` | `/api/config` | 读取当前配置 |
 | `GET` | `/api/metrics` | 指标概览 |

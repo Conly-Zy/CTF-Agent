@@ -2,6 +2,7 @@ package report
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -20,16 +21,17 @@ const (
 
 // Report 解题报告
 type Report struct {
-	Title       string        `json:"title"`
-	SessionID   int64         `json:"session_id"`
-	Challenge   ChallengeInfo `json:"challenge"`
-	Summary     string        `json:"summary"`
-	Timeline    []TimelineEntry `json:"timeline"`
-	ToolsUsed   []ToolUsage   `json:"tools_used"`
-	Flag        string        `json:"flag"`
-	Duration    time.Duration `json:"duration"`
-	Iterations  int           `json:"iterations"`
-	GeneratedAt time.Time     `json:"generated_at"`
+	Title       string           `json:"title"`
+	SessionID   int64            `json:"session_id"`
+	Challenge   ChallengeInfo    `json:"challenge"`
+	Summary     string           `json:"summary"`
+	Timeline    []TimelineEntry  `json:"timeline"`
+	Subtasks    []SubtaskSummary `json:"subtasks,omitempty"`
+	ToolsUsed   []ToolUsage      `json:"tools_used"`
+	Flag        string           `json:"flag"`
+	Duration    time.Duration    `json:"duration"`
+	Iterations  int              `json:"iterations"`
+	GeneratedAt time.Time        `json:"generated_at"`
 }
 
 // ChallengeInfo 题目信息
@@ -41,16 +43,30 @@ type ChallengeInfo struct {
 
 // TimelineEntry 时间线条目
 type TimelineEntry struct {
-	Time    time.Time `json:"time"`
-	Agent   string    `json:"agent,omitempty"`
-	Action  string    `json:"action"`
-	Detail  string    `json:"detail,omitempty"`
+	Time   time.Time `json:"time"`
+	Agent  string    `json:"agent,omitempty"`
+	Action string    `json:"action"`
+	Detail string    `json:"detail,omitempty"`
 }
 
 // ToolUsage 工具使用统计
 type ToolUsage struct {
 	Name  string `json:"name"`
 	Count int    `json:"count"`
+}
+
+// SubtaskSummary is a compact report-facing view of a persisted agent subtask.
+type SubtaskSummary struct {
+	ID          int64     `json:"id"`
+	Agent       string    `json:"agent"`
+	Type        string    `json:"type"`
+	Status      string    `json:"status"`
+	Title       string    `json:"title"`
+	Description string    `json:"description,omitempty"`
+	Result      string    `json:"result,omitempty"`
+	Error       string    `json:"error,omitempty"`
+	StartedAt   time.Time `json:"started_at"`
+	CompletedAt time.Time `json:"completed_at,omitempty"`
 }
 
 // ReportGenerator 报告生成器
@@ -63,7 +79,7 @@ func NewReportGenerator() *ReportGenerator {
 
 // GenerateFromSession 从会话生成报告
 func (g *ReportGenerator) GenerateFromSession(session *store.Session) *Report {
-	return &Report{
+	report := &Report{
 		Title:     fmt.Sprintf("CTF 解题报告 #%d", session.ID),
 		SessionID: session.ID,
 		Challenge: ChallengeInfo{
@@ -75,6 +91,11 @@ func (g *ReportGenerator) GenerateFromSession(session *store.Session) *Report {
 		Iterations:  session.Iterations,
 		GeneratedAt: time.Now(),
 	}
+	if session.DurationMs > 0 {
+		report.Duration = time.Duration(session.DurationMs) * time.Millisecond
+	}
+	report.Summary = g.generateSummary(report)
+	return report
 }
 
 // GenerateFromReplay 从回放数据生成报告
@@ -90,6 +111,7 @@ func (g *ReportGenerator) GenerateFromReplay(session *store.Session, rp *replay.
 	for tool, count := range toolCounts {
 		report.ToolsUsed = append(report.ToolsUsed, ToolUsage{Name: tool, Count: count})
 	}
+	sortToolUsage(report.ToolsUsed)
 
 	// 构建时间线
 	for _, event := range rp.Events {
@@ -134,11 +156,111 @@ func (g *ReportGenerator) GenerateFromReplay(session *store.Session, rp *replay.
 		}
 		report.Timeline = append(report.Timeline, entry)
 	}
+	sortTimeline(report.Timeline)
 
 	// 生成摘要
 	report.Summary = g.generateSummary(report)
 
 	return report
+}
+
+// GenerateFromEvidence builds a report from the persistent execution evidence
+// captured in subtasks/tool_calls. This is the preferred path after the
+// PentAGI-inspired evidence model is available because it does not depend on
+// separate replay files.
+func (g *ReportGenerator) GenerateFromEvidence(session *store.Session, subtasks []store.Subtask, toolCalls []store.ToolCall) *Report {
+	report := g.GenerateFromSession(session)
+
+	toolCounts := make(map[string]int)
+	for _, call := range toolCalls {
+		toolCounts[call.ToolName]++
+		status := "工具调用"
+		if call.Status == "failed" {
+			status = "工具失败"
+		} else if call.Status == "finished" {
+			status = "工具完成"
+		}
+		detail := call.ToolName
+		if call.Error != "" {
+			detail += ": " + call.Error
+		}
+		report.Timeline = append(report.Timeline, TimelineEntry{
+			Time:   call.StartedAt,
+			Agent:  call.AgentName,
+			Action: status,
+			Detail: detail,
+		})
+	}
+	for tool, count := range toolCounts {
+		report.ToolsUsed = append(report.ToolsUsed, ToolUsage{Name: tool, Count: count})
+	}
+	sortToolUsage(report.ToolsUsed)
+
+	for _, st := range subtasks {
+		completedAt := time.Time{}
+		if st.CompletedAt != nil {
+			completedAt = *st.CompletedAt
+		}
+		report.Subtasks = append(report.Subtasks, SubtaskSummary{
+			ID:          st.ID,
+			Agent:       st.AgentName,
+			Type:        st.AgentType,
+			Status:      st.Status,
+			Title:       st.Title,
+			Description: st.Description,
+			Result:      st.Result,
+			Error:       st.Error,
+			StartedAt:   st.CreatedAt,
+			CompletedAt: completedAt,
+		})
+
+		action := "子任务启动"
+		if st.Status == "success" {
+			action = "子任务成功"
+		} else if st.Status == "covered" {
+			action = "计划已覆盖"
+		} else if st.Status == "needs_review" {
+			action = "计划待复盘"
+		} else if st.Status == "skipped" {
+			action = "计划跳过"
+		} else if st.Status == "failed" {
+			action = "子任务失败"
+		} else if st.Status == "finished" {
+			action = "子任务完成"
+		}
+		detail := st.Title
+		if detail == "" {
+			detail = st.Description
+		}
+		if st.Error != "" {
+			detail += ": " + st.Error
+		}
+		report.Timeline = append(report.Timeline, TimelineEntry{
+			Time:   st.CreatedAt,
+			Agent:  st.AgentName,
+			Action: action,
+			Detail: detail,
+		})
+	}
+
+	sortTimeline(report.Timeline)
+	report.Summary = g.generateSummary(report)
+	return report
+}
+
+func sortToolUsage(items []ToolUsage) {
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].Count == items[j].Count {
+			return items[i].Name < items[j].Name
+		}
+		return items[i].Count > items[j].Count
+	})
+}
+
+func sortTimeline(items []TimelineEntry) {
+	sort.SliceStable(items, func(i, j int) bool {
+		return items[i].Time.Before(items[j].Time)
+	})
 }
 
 func (g *ReportGenerator) generateSummary(r *Report) string {
@@ -217,6 +339,18 @@ func (g *ReportGenerator) RenderMarkdown(r *Report) string {
 		sb.WriteString("\n")
 	}
 
+	// 子任务
+	if len(r.Subtasks) > 0 {
+		sb.WriteString("## Agent 子任务\n\n")
+		sb.WriteString("| ID | Agent | 类型 | 状态 | 标题 |\n")
+		sb.WriteString("|----|-------|------|------|------|\n")
+		for _, st := range r.Subtasks {
+			sb.WriteString(fmt.Sprintf("| %d | %s | %s | %s | %s |\n",
+				st.ID, st.Agent, st.Type, st.Status, oneLine(st.Title, 80)))
+		}
+		sb.WriteString("\n")
+	}
+
 	// 时间线
 	if len(r.Timeline) > 0 {
 		sb.WriteString("## 执行时间线\n\n")
@@ -239,4 +373,13 @@ func (g *ReportGenerator) RenderMarkdown(r *Report) string {
 	}
 
 	return sb.String()
+}
+
+func oneLine(s string, maxLen int) string {
+	s = strings.ReplaceAll(s, "\n", " ")
+	s = strings.ReplaceAll(s, "|", "\\|")
+	if len(s) > maxLen {
+		return s[:maxLen] + "..."
+	}
+	return s
 }
